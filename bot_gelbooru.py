@@ -69,6 +69,7 @@ class CooldownManager:
 
 GELBOORU_CD = CooldownManager(rate=3, per=30.0)
 KONACHAN_CD = CooldownManager(rate=3, per=30.0)
+SAFEBOORU_CD = CooldownManager(rate=3, per=30.0)
 TAGS_CD = CooldownManager(rate=1, per=30.0)
 TAGCHECK_CD = CooldownManager(rate=5, per=30.0)
 
@@ -428,12 +429,14 @@ async def fetch_json(
     timeout: aiohttp.ClientTimeout = None,
     retries: int = 3,
     backoff: float = 1.5,
+    base_url: str = None,
 ) -> str | None:
     """GET-запрос с авторетраями на таймаут/ошибку соединения."""
     t = timeout or API_TIMEOUT
+    url = base_url or BASE_URL
     for attempt in range(1, retries + 1):
         try:
-            async with http_session.get(BASE_URL, params=params, headers=headers, timeout=t, proxy=PROXY) as resp:
+            async with http_session.get(url, params=params, headers=headers, timeout=t, proxy=PROXY) as resp:
                 if resp.status == 200:
                     return await resp.text()
                 logger.warning(f"[fetch_json] status={resp.status} attempt={attempt}")
@@ -754,8 +757,11 @@ def format_tags_preview(tags_str: str, limit: int = 14, maxlen: int = 950) -> st
 def post_page_url(post: dict) -> str:
     """Ссылка на страницу поста на его сайте-источнике."""
     pid = post.get("id", "")
-    if post.get("_site") == "Konachan":
+    site = post.get("_site")
+    if site == "Konachan":
         return f"https://konachan.com/post/show/{pid}"
+    if site == "Safebooru":
+        return f"https://safebooru.org/index.php?page=post&s=view&id={pid}"
     return f"https://gelbooru.com/index.php?page=post&s=view&id={pid}"
 
 
@@ -1064,6 +1070,39 @@ async def fetch_konachan(http_session: aiohttp.ClientSession,
     return [normalize_konachan(p) for p in data]
 
 
+# ── Источник: Safebooru (safe-контент, Gelbooru 0.2 API) ──────────────────────
+SAFEBOORU_URL = "https://safebooru.org/index.php"
+
+
+def normalize_safebooru(post: dict) -> dict:
+    """Пост Safebooru → общий вид (md5 из hash, метка сайта)."""
+    p = dict(post)
+    p["md5"] = (post.get("hash") or "").lower()
+    p["_site"] = "Safebooru"
+    return p
+
+
+async def fetch_safebooru(http_session: aiohttp.ClientSession,
+                          tags_clean: list[str], extra_tags: list[str]) -> list[dict]:
+    """Запрос к Safebooru → нормализованные посты.
+
+    Safebooru хостит только safe-контент, поэтому серверный фильтр рейтинга не
+    нужен. Блэклисты (возраст/AI/HARD) всё равно шлём — у safe-арта может быть
+    нежелательный тег. sort:score — наверх самые залайканные.
+    """
+    parts = tags_clean + extra_tags + ["sort:score"]
+    tags_query = (" ".join(parts) + " "
+                  + CRITICAL_BLACKLIST + " " + AI_BLACKLIST + " " + HARD_BLACKLIST)
+    # Свои параметры (без api_key Gelbooru — Safebooru их не ждёт).
+    params = {"page": "dapi", "s": "post", "q": "index", "json": "1",
+              "limit": "100", "tags": tags_query}
+    text = await fetch_json(http_session, params, base_url=SAFEBOORU_URL, retries=3)
+    if not text:
+        return []
+    posts = parse_posts(text) or []
+    return [normalize_safebooru(p) for p in posts]
+
+
 async def run_booru_search(
     interaction: nextcord.Interaction,
     tags: tuple,
@@ -1071,9 +1110,16 @@ async def run_booru_search(
     fetch_fn,
     cooldown: CooldownManager,
     label: str,
+    require_nsfw: bool = True,
+    require_nudity: bool = True,
 ):
-    """Общая логика поиска. Отличие /gelbooru и /konachan — только источник fetch_fn."""
-    if not channel_allows_nsfw(interaction):
+    """Общая логика поиска. Источники отличаются только fetch_fn и флагами.
+
+    require_nsfw  — команда работает лишь в NSFW-каналах/личке (для Gelbooru/Konachan).
+    require_nudity — «строгий» фильтр требует наготы; для Safebooru (safe-контент)
+                     оба флага выключены, но система блокировки тегов та же.
+    """
+    if require_nsfw and not channel_allows_nsfw(interaction):
         return await interaction.response.send_message("🔞 Пиздуй в NSFW канал!", ephemeral=True)
     if await reject_if_on_cooldown(interaction, cooldown):
         return
@@ -1117,12 +1163,14 @@ async def run_booru_search(
     http_session = await get_session()
 
     try:
-        # 1) Сырые посты по тегу + строгий фильтр (требуется нагота).
+        # 1) Сырые посты по тегу + строгий фильтр. Для NSFW-источников «строгий»
+        #    = требуется нагота; для Safebooru (require_nudity=False) — только блэклист.
         raw = dedup_posts(await fetch_fn(http_session, tags_clean, []))
-        strict = [p for p in raw if post_is_clean(p, allowed, require_nudity=True)]
+        strict = [p for p in raw if post_is_clean(p, allowed, require_nudity=require_nudity)]
 
-        # 2) Мало строгих — добираем целевым запросом с nude и снова фильтруем.
-        if len(strict) < MIN_POOL:
+        # 2) Мало строгих — на NSFW-источниках добираем запросом с nude.
+        #    На Safebooru это бессмысленно (тот же safe-запрос), поэтому пропускаем.
+        if require_nudity and len(strict) < MIN_POOL:
             raw = dedup_posts(raw + await fetch_fn(http_session, tags_clean, ["nude"]))
             strict = [p for p in raw if post_is_clean(p, allowed, require_nudity=True)]
 
@@ -1133,7 +1181,7 @@ async def run_booru_search(
         strict_q = weighted_score_shuffle(quality_floor(strict))
         strict_count = len(strict_q)
 
-        if strict_count >= MIN_POOL:
+        if not require_nudity or strict_count >= MIN_POOL:
             pool = strict_q
         else:
             broad = [p for p in raw if post_is_clean(p, allowed, require_nudity=False)]
@@ -1221,6 +1269,23 @@ async def konachan(
     await run_booru_search(
         interaction, (tag, tag2, tag3, tag4),
         fetch_fn=fetch_konachan, cooldown=KONACHAN_CD, label="Konachan",
+    )
+
+
+@bot.slash_command(name='safebooru', description="🟢 Поиск артов на Safebooru (safe-контент, до 4 тегов)")
+async def safebooru(
+    interaction: nextcord.Interaction,
+    tag: str,
+    tag2: str = None,
+    tag3: str = None,
+    tag4: str = None,
+):
+    # Safe-контент → работает в любом канале и не требует наготы. Система
+    # блокировки тегов (venti/lgbt/kanzaki/блэклист) — та же, что у /gelbooru.
+    await run_booru_search(
+        interaction, (tag, tag2, tag3, tag4),
+        fetch_fn=fetch_safebooru, cooldown=SAFEBOORU_CD, label="Safebooru",
+        require_nsfw=False, require_nudity=False,
     )
 
 
