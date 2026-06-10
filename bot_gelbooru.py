@@ -538,6 +538,7 @@ async def download_media(
 @bot.event
 async def on_ready():
     await get_session()  # создаём общую сессию (внутри event loop)
+    load_recent_shown()  # восстанавливаем память показанных артов после рестарта
     logger.info(f"✅ Бот онлайн: {bot.user.name}")
     logger.info("📋 Версия: 1.5 (исправленная)")
     if not API_KEY or not USER_ID:
@@ -905,18 +906,25 @@ def quality_floor(posts: list[dict], floors: list[int] = QUALITY_FLOORS) -> list
     return ranked
 
 
+# Потолок веса при взвешенном перемешивании. √score достигает 12 уже при
+# score≈144, поэтому все «хорошие» арты (после quality_floor) получают почти
+# равный шанс — это и даёт разнообразие, не пуская мусор вперёд залайканного.
+WEIGHT_CAP = 12.0
+
+
 def weighted_score_shuffle(posts: list[dict]) -> list[dict]:
     """Перемешивание с приоритетом по score: чем больше лайков, тем выше шанс
     оказаться в начале — но порядок остаётся случайным, выдача не приедается.
 
     Алгоритм Эфраимидиса–Спиракиса (взвешенная выборка без возврата):
-    ключ = u**(1/weight), сортировка по убыванию. Вес = √score — приоритет
-    лайкам сохраняется, но разброс шире, чем при линейном весе (иначе один
-    топ-арт выпадал бы в половине случаев и выдача повторялась).
+    ключ = u**(1/weight), сортировка по убыванию. Вес = √score с потолком
+    WEIGHT_CAP: приоритет лайкам сохраняется, но один мега-залайканный арт уже
+    не монополизирует топ — внутри «хорошего» тира выбор почти равномерный, и
+    выдача перестаёт приедаться.
     """
     def sort_key(p: dict) -> float:
         score = int(p.get("score", 0) or 0)
-        weight = max(1.0, score) ** 0.5 + 1.0  # √score, вес ≥ 1
+        weight = min(WEIGHT_CAP, max(1.0, score) ** 0.5) + 1.0  # √score с потолком, вес ≥ 1
         u = random.random()
         return u ** (1.0 / weight)
 
@@ -924,8 +932,49 @@ def weighted_score_shuffle(posts: list[dict]) -> list[dict]:
 
 
 # ── Память недавно показанных артов (чтобы выдача не повторялась) ──────────────
-RECENT_MAX = 25  # сколько последних артов помним на каждый тег-запрос
+# Переживает рестарт: пишется в JSON на диск и грузится при старте. Иначе на
+# хостинге каждый редеплой/краш обнулял бы память и повторы возвращались с нуля.
+RECENT_MAX = 60         # сколько последних артов помним на каждый тег-запрос
+RECENT_MAX_KEYS = 500   # сколько тег-запросов держим, прежде чем вытеснять старые
+RECENT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "recent_shown.json")
 _recent_shown: dict[str, deque] = defaultdict(lambda: deque(maxlen=RECENT_MAX))
+
+
+def load_recent_shown() -> None:
+    """Грузит память показанных артов с диска (один раз при старте бота)."""
+    try:
+        with open(RECENT_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return
+    if not isinstance(data, dict):
+        return
+    for key, uids in data.items():
+        if isinstance(uids, list):
+            _recent_shown[key] = deque(uids[-RECENT_MAX:], maxlen=RECENT_MAX)
+    logger.info(f"🗂 Память показанных артов загружена: {len(_recent_shown)} тег-запросов")
+
+
+def save_recent_shown() -> None:
+    """Атомарно сохраняет память на диск; при переполнении вытесняет старые ключи.
+
+    Словари Python хранят порядок вставки, а свежеиспользованный ключ мы двигаем
+    в конец (см. run_booru_search), поэтому срез с начала = выкидываем давно не
+    запрашиваемые теги (псевдо-LRU).
+    """
+    try:
+        items = list(_recent_shown.items())
+        if len(items) > RECENT_MAX_KEYS:
+            for key, _ in items[:len(items) - RECENT_MAX_KEYS]:
+                _recent_shown.pop(key, None)
+            items = items[-RECENT_MAX_KEYS:]
+        data = {key: list(dq) for key, dq in items if dq}
+        tmp = RECENT_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+        os.replace(tmp, RECENT_FILE)
+    except OSError as e:
+        logger.warning(f"Не удалось сохранить память показанных артов: {e}")
 
 
 def post_uid(post: dict) -> str:
@@ -1123,6 +1172,9 @@ async def run_booru_search(
                     file=payload["file"],
                 )
                 recent.append(post_uid(payload["_post"]))  # запомнили показанное
+                _recent_shown.pop(rkey, None)  # двигаем ключ в конец словаря (LRU)
+                _recent_shown[rkey] = recent
+                save_recent_shown()            # переживёт рестарт хостинга
                 break
             except nextcord.HTTPException as e:
                 if getattr(e, "status", None) == 413:

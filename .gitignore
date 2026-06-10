@@ -6,6 +6,10 @@
 # Логи
 *.log
 
+# Рантайм-состояние (память показанных артов)
+recent_shown.json
+recent_shown.json.tmp
+
 # Python
 __pycache__/
 *.pyc
