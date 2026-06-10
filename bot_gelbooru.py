@@ -22,8 +22,16 @@ logging.basicConfig(
 )
 logger = logging.getLogger('gelbooru_bot')
 
+# ID серверов для МГНОВЕННОЙ регистрации слэш-команд. Guild-команды Discord
+# применяет сразу, глобальные — до часа. Несколько ID — через запятую.
+# Пусто/не задано → глобальная регистрация (прежнее поведение).
+GUILD_IDS = [
+    int(g) for g in os.environ.get("DISCORD_GUILD_IDS", "").replace(";", ",").split(",")
+    if g.strip().isdigit()
+]
+
 intents = nextcord.Intents.default()
-bot = commands.Bot(intents=intents)
+bot = commands.Bot(intents=intents, default_guild_ids=GUILD_IDS or None)
 
 # Глобальная сессия для HTTP запросов
 session: aiohttp.ClientSession = None
@@ -562,7 +570,18 @@ async def on_ready():
     elif not (TG_API_ID and TG_API_HASH):
         logger.warning("ℹ️ TG_API_ID / TG_API_HASH не заданы — команда /tg отключена.")
 
-    await bot.sync_application_commands()
+    if GUILD_IDS:
+        # Guild-режим: команды появляются на серверах мгновенно. Дополнительно
+        # сносим старые ГЛОБАЛЬНЫЕ команды, чтобы они не двоились с guild-версиями.
+        await bot.sync_all_application_commands()
+        try:
+            await bot.sync_application_commands(guild_id=None)  # чистка глобальных дублей
+        except Exception as e:
+            logger.warning(f"Не удалось подчистить глобальные команды: {e}")
+        logger.info(f"⚡ Слэш-команды синхронизированы для серверов: {GUILD_IDS}")
+    else:
+        await bot.sync_application_commands()
+        logger.info("🌐 Слэш-команды зарегистрированы глобально (обновление до ~1 часа).")
 
 
 @bot.event
