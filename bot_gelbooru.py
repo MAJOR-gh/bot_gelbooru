@@ -556,15 +556,22 @@ async def on_ready():
 
     # Telegram userbot — поднимаем один раз, переиспользуем общий event loop.
     global tg_client
+    # Диагностика: какие из трёх TG-переменных реально видит процесс (без значений).
+    logger.info(
+        "[tg] env-проверка: TG_API_ID=%s | TG_API_HASH=%s | TG_SESSION_STRING=%s",
+        "есть" if TG_API_ID else "НЕТ",
+        "есть" if TG_API_HASH else "НЕТ",
+        "есть" if tg_source.SESSION_STRING else "НЕТ (будет искать файл сессии)",
+    )
     if tg_client is None and TG_API_ID and TG_API_HASH:
         try:
             tg_client = await tg_source.start_client(int(TG_API_ID), TG_API_HASH)
             chans = tg_source.load_channels()
             logger.info(f"✅ Telegram userbot подключён, каналов в списке: {len(chans)}")
         except Exception as e:
-            logger.error(f"⚠️ Telegram userbot не запущен: {e} — /tg будет недоступна.")
+            logger.error(f"⚠️ Telegram userbot не запущен: {type(e).__name__}: {e} — /tg будет недоступна.")
     elif not (TG_API_ID and TG_API_HASH):
-        logger.warning("ℹ️ TG_API_ID / TG_API_HASH не заданы — команда /tg отключена.")
+        logger.warning("ℹ️ TG_API_ID / TG_API_HASH не заданы (процесс их не видит) — команда /tg отключена.")
 
     if GUILD_IDS:
         # Guild-режим: команды появляются на серверах мгновенно. Дополнительно
