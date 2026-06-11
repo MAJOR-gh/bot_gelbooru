@@ -955,7 +955,7 @@ def weighted_score_shuffle(posts: list[dict]) -> list[dict]:
 # ── Память недавно показанных артов (чтобы выдача не повторялась) ──────────────
 # Переживает рестарт: пишется в JSON на диск и грузится при старте. Иначе на
 # хостинге каждый редеплой/краш обнулял бы память и повторы возвращались с нуля.
-RECENT_MAX = 60         # сколько последних артов помним на каждый тег-запрос
+RECENT_MAX = 300        # сколько последних артов помним на каждый тег-запрос
 RECENT_MAX_KEYS = 500   # сколько тег-запросов держим, прежде чем вытеснять старые
 RECENT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "recent_shown.json")
 _recent_shown: dict[str, deque] = defaultdict(lambda: deque(maxlen=RECENT_MAX))
@@ -1022,9 +1022,35 @@ def dedup_posts(posts: list[dict]) -> list[dict]:
     return out
 
 
+# ── Ротация страниц: расширяем «вселенную» артов, чтобы выдача не повторялась ──
+# Раньше запрос всегда брал страницу 0 (топ-100 по score) — один и тот же набор,
+# поэтому после ~RECENT_MAX показов память упиралась в потолок и повторы
+# возвращались. Теперь к топовой странице 0 подмешиваем несколько случайных
+# «глубоких» страниц: пул вырастает до сотен артов И меняется от запроса к
+# запросу, а качество держит страница 0 (она всегда в выборке).
+FETCH_PAGES = 4          # сколько страниц тянем за запрос (1 топовая + ротация)
+FETCH_PAGE_DEPTH = 12    # из диапазона страниц 1..DEPTH выбираем случайные
+
+
+def rotating_pages(n: int = FETCH_PAGES, depth: int = FETCH_PAGE_DEPTH) -> list[int]:
+    """Страница 0 (топ по score) + (n-1) случайных глубоких страниц (0-based).
+
+    Глубокие страницы ротируются между вызовами → пул кандидатов постоянно
+    обновляется, и при памяти в RECENT_MAX арты перестают повторяться.
+    """
+    if n <= 1:
+        return [0]
+    k = min(n - 1, depth)
+    return [0] + random.sample(range(1, depth + 1), k)
+
+
 async def fetch_gelbooru(http_session: aiohttp.ClientSession,
                          tags_clean: list[str], extra_tags: list[str]) -> list[dict]:
-    """Запрос к Gelbooru → сырые посты (без локального фильтра контента)."""
+    """Запрос к Gelbooru → сырые посты (без локального фильтра контента).
+
+    Тянем несколько страниц параллельно (см. rotating_pages) — широкий и
+    ротируемый пул убирает повторы. Дедуп делается выше по стеку (dedup_posts).
+    """
     # sort:score — берём самые заплюсованные арты (качество), а не случайные.
     # safe/general режем на сервере. Короткие блэклисты (возраст/AI/HARD)
     # уходят в запрос; полный BLACKLIST не шлём (раздувал URL → HTTP 413).
@@ -1032,48 +1058,44 @@ async def fetch_gelbooru(http_session: aiohttp.ClientSession,
              + ["sort:score", "-rating:safe", "-rating:general"])
     tags_query = (" ".join(parts) + " "
                   + CRITICAL_BLACKLIST + " " + AI_BLACKLIST + " " + HARD_BLACKLIST)
-    params = base_params(s="post", limit="100", tags=tags_query)
-    text = await fetch_json(http_session, params, retries=3)
-    if not text:
-        return []
-    posts = parse_posts(text) or []
+    texts = await asyncio.gather(*[
+        fetch_json(http_session,
+                   base_params(s="post", limit="100", pid=str(pg), tags=tags_query),
+                   retries=3)
+        for pg in rotating_pages()
+    ])
+    posts: list[dict] = []
+    for text in texts:
+        if text:
+            posts.extend(parse_posts(text) or [])
     for p in posts:
         p["_site"] = "Gelbooru"
     return posts
 
 
-async def fetch_konachan(http_session: aiohttp.ClientSession,
-                         tags_clean: list[str], extra_tags: list[str]) -> list[dict]:
-    """Запрос к Konachan (Moebooru) → нормализованные посты.
-
-    Из-за лимита ≤6 тегов блэклисты НЕ шлём — контент фильтрует post_is_clean
-    локально. На сервере отсекаем только safe (`-rating:s`).
-    """
-    base = list(tags_clean) + list(extra_tags)
-    query_tags = base + ["-rating:s", "order:score"]
-    if len(query_tags) > KONACHAN_MAX_TAGS:
-        query_tags = (base + ["-rating:s"])[:KONACHAN_MAX_TAGS]
-    params = {"tags": " ".join(query_tags), "limit": "100"}
-
+async def _konachan_page(http_session: aiohttp.ClientSession,
+                         query_tags: list[str], page: int) -> list[dict]:
+    """Одна страница Konachan (Moebooru `page` — 1-based). Возвращает посты."""
+    params = {"tags": " ".join(query_tags), "limit": "100", "page": str(page)}
     text = None
     for attempt in range(1, 3):
         try:
             async with http_session.get(KONACHAN_URL, params=params, headers=headers,
                                         timeout=API_TIMEOUT, proxy=PROXY) as resp:
                 if resp.status != 200:
-                    logger.warning(f"[konachan] status={resp.status}")
+                    logger.warning(f"[konachan] status={resp.status} page={page}")
                     return []
                 text = await resp.text()
                 break
         except (aiohttp.ServerTimeoutError, asyncio.TimeoutError,
                 aiohttp.ClientConnectionError) as e:
-            logger.warning(f"[konachan] timeout/disconnect attempt={attempt}: {e}")
+            logger.warning(f"[konachan] timeout/disconnect page={page} attempt={attempt}: {e}")
             if attempt < 2:
                 await asyncio.sleep(1.0)
             else:
                 return []
         except Exception as e:
-            logger.warning(f"[konachan] error: {e}")
+            logger.warning(f"[konachan] error page={page}: {e}")
             return []
 
     try:
@@ -1083,6 +1105,30 @@ async def fetch_konachan(http_session: aiohttp.ClientSession,
     if not isinstance(data, list):
         return []
     return [normalize_konachan(p) for p in data]
+
+
+async def fetch_konachan(http_session: aiohttp.ClientSession,
+                         tags_clean: list[str], extra_tags: list[str]) -> list[dict]:
+    """Запрос к Konachan (Moebooru) → нормализованные посты.
+
+    Из-за лимита ≤6 тегов блэклисты НЕ шлём — контент фильтрует post_is_clean
+    локально. На сервере отсекаем только safe (`-rating:s`). Несколько страниц
+    с ротацией (см. rotating_pages) расширяют пул и убирают повторы.
+    """
+    base = list(tags_clean) + list(extra_tags)
+    query_tags = base + ["-rating:s", "order:score"]
+    if len(query_tags) > KONACHAN_MAX_TAGS:
+        query_tags = (base + ["-rating:s"])[:KONACHAN_MAX_TAGS]
+
+    # rotating_pages() даёт 0-based номера; Moebooru считает с 1 → +1.
+    pages = [p + 1 for p in rotating_pages()]
+    results = await asyncio.gather(*[
+        _konachan_page(http_session, query_tags, pg) for pg in pages
+    ])
+    posts: list[dict] = []
+    for chunk in results:
+        posts.extend(chunk)
+    return posts
 
 
 # ── Источник: Safebooru (safe-контент, Gelbooru 0.2 API) ──────────────────────
@@ -1108,13 +1154,21 @@ async def fetch_safebooru(http_session: aiohttp.ClientSession,
     parts = tags_clean + extra_tags + ["sort:score"]
     tags_query = (" ".join(parts) + " "
                   + CRITICAL_BLACKLIST + " " + AI_BLACKLIST + " " + HARD_BLACKLIST)
-    # Свои параметры (без api_key Gelbooru — Safebooru их не ждёт).
-    params = {"page": "dapi", "s": "post", "q": "index", "json": "1",
-              "limit": "100", "tags": tags_query}
-    text = await fetch_json(http_session, params, base_url=SAFEBOORU_URL, retries=3)
-    if not text:
-        return []
-    posts = parse_posts(text) or []
+
+    # Свои параметры (без api_key Gelbooru — Safebooru их не ждёт). Несколько
+    # страниц с ротацией (см. rotating_pages) расширяют пул и убирают повторы.
+    def _params(pg: int) -> dict:
+        return {"page": "dapi", "s": "post", "q": "index", "json": "1",
+                "limit": "100", "pid": str(pg), "tags": tags_query}
+
+    texts = await asyncio.gather(*[
+        fetch_json(http_session, _params(pg), base_url=SAFEBOORU_URL, retries=3)
+        for pg in rotating_pages()
+    ])
+    posts: list[dict] = []
+    for text in texts:
+        if text:
+            posts.extend(parse_posts(text) or [])
     return [normalize_safebooru(p) for p in posts]
 
 
