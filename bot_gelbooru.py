@@ -363,14 +363,14 @@ def tag_is_blocked(clean_tag: str) -> bool:
 POPULAR_TAGS = [
     "1girl", "1boy", "2girls", "solo", "couple", "multiple_girls", "group",
     "breasts", "ass", "nude", "censored", "uncensored", "bikini", "school_uniform",
-    "cat_ears", "neko", "kemonomimi", "maid", "twintails", "blonde", "blue_hair",
+    "cat_ears", "kemonomimi", "maid", "twintails", "blonde", "blue_hair",
     "brown_hair", "pink_hair", "purple_hair", "red_hair", "white_hair", "silver_hair",
     "long_hair", "short_hair", "curly_hair", "twisted_torso", "highres",
-    "masterpiece", "abs", "flexible", "looking_at_viewer", "smile", "blush",
+    "abs", "flexible", "looking_at_viewer", "smile", "blush",
     "outdoor", "indoor", "bed", "forest", "city", "beach", "swimsuit",
     "lingerie", "underwear", "thighhighs", "stockings", "socks", "gloves",
     "hat", "hairband", "ribbons", "bow", "glasses", "eyes", "hetero",
-    "wallpaper", "comic", "game_cg", "western",
+    "comic", "game_cg", "western",
 ]
 
 # Вшитые данные Gelbooru (API Access Credentials).
