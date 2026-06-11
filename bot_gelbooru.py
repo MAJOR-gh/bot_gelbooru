@@ -49,7 +49,7 @@ async def get_session() -> aiohttp.ClientSession:
     """Получить или создать глобальную сессию (создаётся внутри event loop)."""
     global session
     if session is None or session.closed:
-        connector = aiohttp.TCPConnector(limit=20, ttl_dns_cache=300)
+        connector = aiohttp.TCPConnector(limit=40, ttl_dns_cache=300)
         session = aiohttp.ClientSession(connector=connector)
     return session
 
@@ -1028,8 +1028,9 @@ def dedup_posts(posts: list[dict]) -> list[dict]:
 # возвращались. Теперь к топовой странице 0 подмешиваем несколько случайных
 # «глубоких» страниц: пул вырастает до сотен артов И меняется от запроса к
 # запросу, а качество держит страница 0 (она всегда в выборке).
-FETCH_PAGES = 4          # сколько страниц тянем за запрос (1 топовая + ротация)
-FETCH_PAGE_DEPTH = 12    # из диапазона страниц 1..DEPTH выбираем случайные
+FETCH_PAGES = 12         # сколько страниц тянем за запрос (1 топовая + ротация)
+FETCH_PAGE_DEPTH = 24    # из диапазона страниц 1..DEPTH выбираем случайные
+                         # (DEPTH держим выше FETCH_PAGES, иначе ротация пропадёт)
 
 
 def rotating_pages(n: int = FETCH_PAGES, depth: int = FETCH_PAGE_DEPTH) -> list[int]:
