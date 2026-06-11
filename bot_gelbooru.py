@@ -378,8 +378,21 @@ API_KEY = os.environ.get("GELBOORU_API_KEY") or DEFAULT_API_KEY
 USER_ID = os.environ.get("GELBOORU_USER_ID") or DEFAULT_USER_ID
 
 # ── Telegram userbot (источник /tg) ────────────────────────────────────────────
-TG_API_ID = os.environ.get("TG_API_ID")
-TG_API_HASH = os.environ.get("TG_API_HASH")
+def env_any(*names: str) -> str | None:
+    """Первое непустое значение среди нескольких имён env (с обрезкой пробелов).
+
+    Хостинги/люди называют переменные по-разному (TG_API_ID, API_ID, TG_ID…) —
+    ловим самые частые варианты, чтобы /tg не отваливалась из-за имени.
+    """
+    for n in names:
+        v = os.environ.get(n)
+        if v and v.strip():
+            return v.strip()
+    return None
+
+
+TG_API_ID = env_any("TG_API_ID", "API_ID", "TELEGRAM_API_ID", "TG_ID")
+TG_API_HASH = env_any("TG_API_HASH", "API_HASH", "TELEGRAM_API_HASH", "TG_HASH")
 tg_client = None  # Telethon-клиент; поднимается в on_ready, None если ключи не заданы
 TG_CD = CooldownManager(rate=3, per=30.0)
 # Пороги реакций для отсева слабых постов (реакций меньше, чем score Gelbooru).

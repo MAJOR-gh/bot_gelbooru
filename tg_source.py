@@ -14,9 +14,22 @@ from telethon.sessions import StringSession
 logger = logging.getLogger("gelbooru_bot.tg")
 
 SESSION_NAME = "tg_userbot"
+
+
+def _env_any(*names: str) -> str | None:
+    """Первое непустое значение среди нескольких имён env (с обрезкой пробелов)."""
+    for n in names:
+        v = os.environ.get(n)
+        if v and v.strip():
+            return v.strip()
+    return None
+
+
 # Сессия строкой (для хостинга/Docker — файл *.session не доезжает через git).
-# Если задана TG_SESSION_STRING, используем её; иначе — файловую сессию (локалка).
-SESSION_STRING = os.environ.get("TG_SESSION_STRING")
+# Ловим несколько частых имён переменной; если задана — используем её, иначе
+# падаем на файловую сессию (локалка).
+SESSION_STRING = _env_any("TG_SESSION_STRING", "SESSION_STRING",
+                          "TG_SESSION", "STRING_SESSION", "TG_STRING_SESSION")
 CHANNELS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tg_channels.json")
 
 # Сколько последних сообщений канала просматриваем за один запрос.
