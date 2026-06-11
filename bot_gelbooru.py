@@ -110,11 +110,11 @@ def channel_allows_nsfw(interaction: nextcord.Interaction) -> bool:
 
 # ── Блэклист ────────────────────────────────────────────────────────────────
 _BLACKLIST_TAGS = [
-    "loli", "shota", "underage", "young", "child", "minor", "aged_down",
-    "scat", "gore", "blood", "snuff", "rape", "abuse", "feces", "vore",
+    "loli", "shota", "underage", "young", "child", "aged_down",
+    "gore", "blood", "snuff", "rape", "abuse", "vore",
     "torture", "mutilation",
-    "tentacles", "bestiality", "zoophilia", "inflation", "watersports",
-    "piss", "pee", "peeing", "urine", "omorashi",
+    "tentacles", "bestiality", "zoophilia", "inflation",
+    "piss", "pee", "peeing", "urine",
     "fart", "toilet", "diaper", "pregnancy", "pregnant", "birth", "group_sex",
     "furry", "anthro", "animal", "dog", "cat", "horse", "fox",
     "the_simpsons", "bart_simpson", "homer_simpson",
@@ -125,24 +125,22 @@ _BLACKLIST_TAGS = [
     "netorare", "ntr", "cheating", "cuckold",
     "mindbreak", "mind_control",
     "ryona", "bdsm", "bondage", "gag",
-    "ai_generated", "ai_art", "stable_diffusion", "novelai", "midjourney",
-    "nai_diffusion",
+    "ai_generated",
     "armpit_hair", "pubic_hair", "body_hair", "chest_hair", "leg_hair", "hairy",
     "smegma",
-    "ugly", "ugly_man", "ugly_bastard", "old_man", "old_guy", "oyaji",
-    "fat", "obese", "overweight", "chubby_male",
+    "ugly", "ugly_man", "ugly_bastard", "old_man",
+    "fat", "obese", "overweight",
     "stubble",
-    "vomit", "puke", "crying", "tears_of_pain",
-    "forced", "non-consensual", "dubcon",
-    "muscle_female", "extremely_muscular",
+    "vomit", "puke", "crying",
+    "forced",
     "huge_belly", "saggy_breasts", "wrinkles",
     "bad_anatomy", "bad_hands", "bad_feet", "bad_face",
-    "cuntboy", "gay", "lesbian", "shit", "dark-skinned_male",
-    "male/male", "same_size_vore",
+    "cuntboy", "gay", "lesbian", "dark-skinned_male",
+    "male/male",
     "orc",
     # ── низкое качество / трешак (локальный отсев, не навязывает типаж) ──
     "lowres", "sketch", "wip", "unfinished", "jpeg_artifacts",
-    "bad_proportions", "poorly_drawn", "ms_paint", "scan", "what",
+    "bad_proportions", "poorly_drawn", "scan", "what",
     "old_woman", "granny",
 ]
 
@@ -157,7 +155,7 @@ BLACKLIST_SET: set[str] = set(_BLACKLIST_TAGS)
 # чтобы Gelbooru отсекал их на сервере, а не только локально.
 _CRITICAL_TAGS = [
     "loli", "shota", "lolicon", "shotacon", "toddlercon",
-    "underage", "child", "minor", "aged_down", "young",
+    "underage", "child", "aged_down", "young",
 ]
 CRITICAL_BLACKLIST = " ".join(f"-{t}" for t in _CRITICAL_TAGS)
 # Локальная подстраховка: ловим и подстроки (loli внутри loli_dominance и т.п.)
@@ -167,9 +165,7 @@ CRITICAL_SET: set[str] = set(_CRITICAL_TAGS)
 # Основной тег Gelbooru пишется через ДЕФИС ("ai-generated"). Шлём в API всегда
 # (короткий список, 413 не вызовет) + локальная подстраховка по подстрокам.
 _AI_TAGS = [
-    "ai-generated", "ai-created", "ai-assisted", "ai_generated", "ai_art",
-    "ai_art_(generation)", "stable_diffusion", "novelai", "nai_diffusion",
-    "midjourney", "dall-e",
+    "ai-generated", "ai-created", "ai-assisted", "ai_generated",
 ]
 AI_BLACKLIST = " ".join(f"-{t}" for t in _AI_TAGS)
 # Для локальной фильтрации сводим к корням, чтобы ловить любые вариации
@@ -186,7 +182,7 @@ _HARD_TAGS = [
     "male/male", "boy_on_top", "male_focus", "1boy", "cum_on_male",
     # фембои / трапы / переодевание
     "femboy", "trap", "crossdressing", "otoko_no_ko", "cuntboy", "tomgirl",
-    "astolfo_(fate)", "astolfo", "felix", "felix_argyle", "felix_argyle_(re:zero)",
+    "astolfo_(fate)", "astolfo", "felix_argyle",
     # футанари
     "futanari", "futa", "futa_on_male", "newhalf", "dickgirl",
     # бондаж / БДСМ / насилие в кадре
