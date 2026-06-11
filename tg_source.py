@@ -9,10 +9,14 @@ import os
 import logging
 
 from telethon import TelegramClient
+from telethon.sessions import StringSession
 
 logger = logging.getLogger("gelbooru_bot.tg")
 
 SESSION_NAME = "tg_userbot"
+# Сессия строкой (для хостинга/Docker — файл *.session не доезжает через git).
+# Если задана TG_SESSION_STRING, используем её; иначе — файловую сессию (локалка).
+SESSION_STRING = os.environ.get("TG_SESSION_STRING")
 CHANNELS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tg_channels.json")
 
 # Сколько последних сообщений канала просматриваем за один запрос.
@@ -31,13 +35,23 @@ AD_KEYWORDS = (
 
 # ── Клиент ─────────────────────────────────────────────────────────────────────
 async def start_client(api_id: int, api_hash: str) -> TelegramClient:
-    """Поднять Telethon-клиент на уже авторизованной сессии (в текущем loop)."""
-    client = TelegramClient(SESSION_NAME, api_id, api_hash)
+    """Поднять Telethon-клиент на уже авторизованной сессии (в текущем loop).
+
+    На хостинге сессия берётся из env TG_SESSION_STRING (StringSession), локально —
+    из файла tg_userbot.session. Так секрет-сессия не лежит в git/Docker-образе.
+    """
+    if SESSION_STRING:
+        logger.info("[tg] использую сессию из TG_SESSION_STRING (env)")
+        client = TelegramClient(StringSession(SESSION_STRING), api_id, api_hash)
+    else:
+        logger.info("[tg] использую файловую сессию tg_userbot.session")
+        client = TelegramClient(SESSION_NAME, api_id, api_hash)
     await client.connect()
     if not await client.is_user_authorized():
         await client.disconnect()
         raise RuntimeError(
-            "Сессия Telegram не авторизована — запусти `python tg_login.py`."
+            "Сессия Telegram не авторизована. Локально — запусти `python tg_login.py`; "
+            "на хостинге — задай env TG_SESSION_STRING (см. `python tg_export_session.py`)."
         )
     # Прогреваем кэш диалогов: без этого приватные каналы (по числовому ID, без
     # @username) не резолвятся в iter_messages.
