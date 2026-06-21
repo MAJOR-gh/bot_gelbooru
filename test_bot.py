@@ -65,5 +65,57 @@ b.USER_ID = ""
 p2 = b.base_params(s="post")
 check("omits api_key when empty", "api_key" not in p2)
 
+print("== focus_groups_for ==")
+check("breasts -> {breasts}", b.focus_groups_for(["breasts"]) == {"breasts"})
+check("large_breasts -> {breasts}", b.focus_groups_for(["large_breasts"]) == {"breasts"})
+check("ass -> {ass}", b.focus_groups_for(["ass"]) == {"ass"})
+check("breasts+ass -> both", b.focus_groups_for(["breasts", "ass"]) == {"breasts", "ass"})
+check("character -> empty", b.focus_groups_for(["hatsune_miku"]) == set())
+check("case-insensitive", b.focus_groups_for(["Breasts"]) == {"breasts"})
+
+print("== requested_nudity_tags ==")
+check("no group -> None (legacy full set)", b.requested_nudity_tags(set()) is None)
+nb = b.requested_nudity_tags({"breasts"})
+check("breasts: nipples counts", "nipples" in nb)
+check("breasts: general nude counts", "nude" in nb)
+check("breasts: bare ass does NOT count", "ass" not in nb)
+check("breasts: bare pussy does NOT count", "pussy" not in nb)
+na = b.requested_nudity_tags({"ass"})
+check("ass: bare ass counts", "ass" in na)
+check("ass: bare pussy does NOT count", "pussy" not in na)
+
+print("== _focus_tier (relevance) ==")
+G = {"breasts"}
+check("on-only -> tier 3", b._focus_tier({"tags": "1girl large_breasts nude"}, G) == 3)
+check("on+off -> tier 2", b._focus_tier({"tags": "large_breasts ass_focus"}, G) == 2)
+check("neutral -> tier 1", b._focus_tier({"tags": "1girl smile standing"}, G) == 1)
+check("off-only -> tier 0", b._focus_tier({"tags": "1girl ass_focus from_behind"}, G) == 0)
+check("no group -> tier 0 for all", b._focus_tier({"tags": "large_breasts"}, set()) == 0)
+
+print("== focus_rerank (soft priority, stable within tier) ==")
+posts = [
+    {"id": "off", "tags": "ass_focus from_behind"},      # tier 0
+    {"id": "on", "tags": "huge_breasts cleavage"},       # tier 3
+    {"id": "mix", "tags": "large_breasts spread_pussy"}, # tier 2
+    {"id": "neu", "tags": "1girl smile"},                # tier 1
+]
+ranked = [p["id"] for p in b.focus_rerank(posts, {"breasts"})]
+check("order on>mix>neu>off", ranked == ["on", "mix", "neu", "off"])
+check("off-focus kept (fallback, not dropped)", "off" in ranked)
+check("empty group -> unchanged order",
+      [p["id"] for p in b.focus_rerank(posts, set())] == ["off", "on", "mix", "neu"])
+
+print("== post_is_clean: nudity tied to focus ==")
+breasts_nud = b.requested_nudity_tags({"breasts"})
+ass_nud = b.requested_nudity_tags({"ass"})
+check("breasts req: bare-ass post rejected",
+      b.post_is_clean({"tags": "1girl ass"}, nudity_tags=breasts_nud) is False)
+check("breasts req: nipples post passes",
+      b.post_is_clean({"tags": "1girl nipples"}, nudity_tags=breasts_nud) is True)
+check("ass req: bare-ass post passes",
+      b.post_is_clean({"tags": "1girl ass"}, nudity_tags=ass_nud) is True)
+check("legacy (no override): bare-ass still passes",
+      b.post_is_clean({"tags": "1girl ass"}) is True)
+
 print(f"\n==== {passed} passed, {failed} failed ====")
 raise SystemExit(1 if failed else 0)

@@ -221,8 +221,120 @@ NUDITY_TAGS: set[str] = {
 DRESSED_TAGS: set[str] = {"fully_clothed", "fully_dressed", "dressed"}
 
 
+# ── Фокус по части тела: приоритет запрошенного, демоция «не того» сюжета ──────
+# Юзер ищет breasts, но в топе по score часто арт, где сюжет — ass/pussy, а тег
+# breasts лишь присутствует. Поднимаем посты, где сюжет = запрошенная часть, и
+# опускаем те, где сюжет — часть, которую НЕ просили. Имена тегов сверены по
+# Gelbooru API: emphasis-семья (large/huge_breasts, cleavage, nipples…) надёжнее
+# редких *_focus (breast_focus ~6k, pussy_focus ~1k постов).
+
+# «Конкурирующие» телесные nudity-теги: голая жопа/писька сама по себе НЕ должна
+# засчитывать наготу для запроса breasts. Раздаются по группам ниже.
+_BODYPART_NUDITY: set[str] = {"pussy", "cameltoe", "ass", "thong", "anus"}
+# Общая нагота (не привязана к конкретной части). Для не-телесных запросов
+# используется весь NUDITY_TAGS (как раньше).
+GENERAL_NUDITY: set[str] = NUDITY_TAGS - _BODYPART_NUDITY
+
+FOCUS_GROUPS: dict[str, dict[str, set[str]]] = {
+    "breasts": {
+        # тег юзера → активирует эту группу как «запрошенную»
+        "triggers": {"breasts", "large_breasts", "huge_breasts", "gigantic_breasts",
+                     "medium_breasts", "small_breasts", "cleavage", "underboob",
+                     "sideboob", "paizuri", "oppai", "boobs"},
+        # сюжет поста = грудь (emphasis / close-up / захват)
+        "focus": {"large_breasts", "huge_breasts", "gigantic_breasts", "medium_breasts",
+                  "cleavage", "underboob", "sideboob", "paizuri", "breasts_out",
+                  "between_breasts", "breast_focus", "cleavage_cutout", "breast_grab",
+                  "breast_press", "breast_hold", "nipples", "bare_breasts",
+                  "exposed_breasts", "oppai"},
+        # засчитывается как нагота при запросе груди
+        "nudity": {"nipples", "breasts_out", "bare_breasts", "exposed_breasts",
+                   "no_bra", "paizuri", "areola_slip", "nipple_slip"},
+    },
+    "ass": {
+        "triggers": {"ass", "huge_ass", "big_ass", "large_ass", "ass_focus",
+                     "anus", "butt", "booty"},
+        "focus": {"huge_ass", "big_ass", "large_ass", "ass_focus", "from_behind",
+                  "bent_over", "spread_ass", "top-down_bottom-up", "backboob",
+                  "ass_visible_through_thighs", "anus", "ass_grab"},
+        "nudity": {"ass", "anus", "thong"},
+    },
+    "pussy": {
+        "triggers": {"pussy", "vagina", "vaginal", "spread_pussy", "clitoris",
+                     "cameltoe"},
+        "focus": {"spread_pussy", "pussy_focus", "clitoris", "pussy_juice",
+                  "cameltoe", "female_ejaculation", "after_vaginal", "gaping"},
+        "nudity": {"pussy", "cameltoe"},
+    },
+    "feet": {
+        "triggers": {"feet", "foot", "feet_focus", "foot_focus", "soles", "toes",
+                     "footjob", "barefoot"},
+        "focus": {"feet_focus", "foot_focus", "soles", "toes", "footjob",
+                  "foot_worship"},
+        "nudity": set(),
+    },
+}
+
+# тег пользователя → ключ группы (обратный индекс по triggers)
+_TAG_TO_GROUP: dict[str, str] = {
+    t: g for g, d in FOCUS_GROUPS.items() for t in d["triggers"]
+}
+_ALL_GROUPS: set[str] = set(FOCUS_GROUPS)
+
+
+def focus_groups_for(tags_clean: list[str]) -> set[str]:
+    """Какие телесные группы запросил юзер (по совпадению тега с triggers)."""
+    return {_TAG_TO_GROUP[t] for t in (x.lower() for x in tags_clean)
+            if t in _TAG_TO_GROUP}
+
+
+def requested_nudity_tags(groups: set[str]) -> set[str] | None:
+    """Набор тегов, засчитываемых как «нагота» под конкретный запрос.
+
+    Юзер ищет часть тела → нагота подтверждается ОБЩЕЙ наготой или наготой
+    ИМЕННО запрошенной части. «Голая жопа/писька» сама по себе тег breasts не
+    вытягивает. Без телесного запроса → None (полный NUDITY_TAGS, как раньше).
+    """
+    if not groups:
+        return None
+    nud = set(GENERAL_NUDITY)
+    for g in groups:
+        nud |= FOCUS_GROUPS[g]["nudity"]
+    return nud
+
+
+def _focus_tier(post: dict, groups: set[str]) -> int:
+    """Тир релевантности поста запрошенной части тела (больше = выше в выдаче).
+
+      3 — сюжет = запрошенная часть (и только она);
+      2 — запрошенная часть в фокусе, но в кадре и другая;
+      1 — нейтрально (тег есть, явного фокуса ни на чём нет);
+      0 — сюжет = часть, которую НЕ просили (ровно то, на что жаловались).
+    """
+    if not groups:
+        return 0
+    low = {t.lower() for t in (post.get("tags", "") or "").split()}
+    on = any(low & FOCUS_GROUPS[g]["focus"] for g in groups)
+    off = any(low & FOCUS_GROUPS[g]["focus"] for g in (_ALL_GROUPS - groups))
+    if on:
+        return 3 if not off else 2
+    return 1 if not off else 0
+
+
+def focus_rerank(posts: list[dict], groups: set[str]) -> list[dict]:
+    """Мягкий приоритет по фокусу с фолбэком: стабильная пересортировка по
+    фокус-тиру. off-focus НЕ выкидываем — лишь опускаем вниз (по нишевым тегам
+    выдача не опустеет). Внутри тира порядок сохраняется, значит приоритет
+    качества из weighted_score_shuffle не теряется.
+    """
+    if not groups:
+        return posts
+    return sorted(posts, key=lambda p: _focus_tier(p, groups), reverse=True)
+
+
 def post_is_clean(post: dict, allowed: set[str] | None = None,
-                  require_nudity: bool = True) -> bool:
+                  require_nudity: bool = True,
+                  nudity_tags: set[str] | None = None) -> bool:
     """True если пост допустим к показу.
 
     Правила (по приоритету):
@@ -259,7 +371,10 @@ def post_is_clean(post: dict, allowed: set[str] | None = None,
 
     # 5. Требование наготы (полная или частичная). В «умном» ослаблении выключается:
     #    тогда проходит любой NSFW-результат (safe/general уже отсечены на сервере).
-    if require_nudity and low_tags.isdisjoint(NUDITY_TAGS):
+    #    nudity_tags задаёт набор под конкретный запрос (см. requested_nudity_tags):
+    #    при поиске части тела «голая жопа» не засчитывает наготу для breasts.
+    nud = nudity_tags if nudity_tags is not None else NUDITY_TAGS
+    if require_nudity and low_tags.isdisjoint(nud):
         return False
 
     return True
@@ -1256,25 +1371,35 @@ async def run_booru_search(
             return await interaction.followup.send("🚫 Один из тегов заблокирован.", ephemeral=True)
 
     allowed = set(tags_clean)
+    # Запрошенные телесные группы → приоритет фокуса + сужение «наготы».
+    requested_groups = focus_groups_for(tags_clean)
+    req_nudity = requested_nudity_tags(requested_groups)
     http_session = await get_session()
 
     try:
         # 1) Сырые посты по тегу + строгий фильтр. Для NSFW-источников «строгий»
         #    = требуется нагота; для Safebooru (require_nudity=False) — только блэклист.
         raw = dedup_posts(await fetch_fn(http_session, tags_clean, []))
-        strict = [p for p in raw if post_is_clean(p, allowed, require_nudity=require_nudity)]
+        strict = [p for p in raw
+                  if post_is_clean(p, allowed, require_nudity=require_nudity,
+                                   nudity_tags=req_nudity)]
 
         # 2) Мало строгих — на NSFW-источниках добираем запросом с nude.
         #    На Safebooru это бессмысленно (тот же safe-запрос), поэтому пропускаем.
         if require_nudity and len(strict) < MIN_POOL:
             raw = dedup_posts(raw + await fetch_fn(http_session, tags_clean, ["nude"]))
-            strict = [p for p in raw if post_is_clean(p, allowed, require_nudity=True)]
+            strict = [p for p in raw
+                      if post_is_clean(p, allowed, require_nudity=True,
+                                       nudity_tags=req_nudity)]
 
         # 3) Порог качества + умное ослабление. Посты уже приходят с sort:score,
         #    здесь отсекаем низкорейтинговый хвост и перемешиваем взвешенно
         #    (по score) — самые залайканные в приоритете, но выдача не приедается.
         #    Раздетое (strict) всегда идёт первым; одетое добираем, только если мало.
-        strict_q = weighted_score_shuffle(quality_floor(strict))
+        #    focus_rerank поднимает арт с фокусом на запрошенной части тела
+        #    (внутри тира порядок качества из weighted_score_shuffle сохраняется).
+        strict_q = focus_rerank(weighted_score_shuffle(quality_floor(strict)),
+                                requested_groups)
         strict_count = len(strict_q)
 
         if not require_nudity or strict_count >= MIN_POOL:
@@ -1282,8 +1407,11 @@ async def run_booru_search(
         else:
             broad = [p for p in raw if post_is_clean(p, allowed, require_nudity=False)]
             strict_obj = {id(p) for p in strict}
-            extra = weighted_score_shuffle(
-                quality_floor([p for p in broad if id(p) not in strict_obj])
+            extra = focus_rerank(
+                weighted_score_shuffle(
+                    quality_floor([p for p in broad if id(p) not in strict_obj])
+                ),
+                requested_groups,
             )
             pool = strict_q + extra
 
