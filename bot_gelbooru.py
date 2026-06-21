@@ -75,9 +75,11 @@ class CooldownManager:
         return 0.0
 
 
-GELBOORU_CD = CooldownManager(rate=3, per=30.0)
-KONACHAN_CD = CooldownManager(rate=3, per=30.0)
-SAFEBOORU_CD = CooldownManager(rate=3, per=30.0)
+# Поисковые кулдауны: 5 запросов за 30 сек = в среднем 1 поиск раз в 6 секунд
+# на пользователя (с небольшим допуском на всплеск).
+GELBOORU_CD = CooldownManager(rate=5, per=30.0)
+KONACHAN_CD = CooldownManager(rate=5, per=30.0)
+SAFEBOORU_CD = CooldownManager(rate=5, per=30.0)
 TAGS_CD = CooldownManager(rate=1, per=30.0)
 TAGCHECK_CD = CooldownManager(rate=5, per=30.0)
 
