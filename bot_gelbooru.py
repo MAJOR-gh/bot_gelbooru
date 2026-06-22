@@ -22,6 +22,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger('gelbooru_bot')
 
+# Единый источник версии (раньше «1.5» был зашит в логах и /help и отставал).
+VERSION = "2.5"
+
 # ID серверов для МГНОВЕННОЙ регистрации слэш-команд. Guild-команды Discord
 # применяет сразу, глобальные — до часа. Несколько ID — через запятую.
 # Пусто/не задано → глобальная регистрация (прежнее поведение).
@@ -126,7 +129,7 @@ _BLACKLIST_TAGS = [
     "futa", "futanari", "trap", "crossdressing", "femboy",
     "netorare", "ntr", "cheating", "cuckold",
     "mindbreak", "mind_control",
-    "ryona", "bdsm", "bondage", "gag",
+    "ryona", "bdsm", "bondage", "gag", "dildo",
     "ai_generated",
     "armpit_hair", "pubic_hair", "body_hair", "chest_hair", "leg_hair", "hairy",
     "smegma",
@@ -677,7 +680,7 @@ async def on_ready():
     await get_session()  # создаём общую сессию (внутри event loop)
     load_recent_shown()  # восстанавливаем память показанных артов после рестарта
     logger.info(f"✅ Бот онлайн: {bot.user.name}")
-    logger.info("📋 Версия: 1.5 (исправленная)")
+    logger.info(f"📋 Версия: {VERSION}")
     if not API_KEY or not USER_ID:
         logger.warning("⚠️ GELBOORU_API_KEY / GELBOORU_USER_ID не заданы — "
                        "возможны ограничения API Gelbooru.")
@@ -703,18 +706,35 @@ async def on_ready():
     elif not (TG_API_ID and TG_API_HASH):
         logger.warning("ℹ️ TG_API_ID / TG_API_HASH не заданы (процесс их не видит) — команда /tg отключена.")
 
+    # Регистрация слэш-команд БЕЗ дублей. Дубль в списке Discord возникает, когда
+    # одна команда живёт сразу в ДВУХ скоупах — глобальном и guild: Discord тогда
+    # показывает её дважды. Поэтому перед синком ПОЛНОСТЬЮ сносим «лишний» скоуп
+    # прямым bulk-овеписом пустым списком — это надёжнее, чем sync с delete_unknown
+    # (тот молча не срабатывал, дубли оставались).
+    app_id = bot.application_id
     if GUILD_IDS:
-        # Guild-режим: команды появляются на серверах мгновенно. Дополнительно
-        # сносим старые ГЛОБАЛЬНЫЕ команды, чтобы они не двоились с guild-версиями.
-        await bot.sync_all_application_commands()
+        # Guild-режим: команды на серверах появляются мгновенно. Сносим ВСЕ
+        # глобальные команды (иначе они двоятся с guild-копиями), затем
+        # регистрируем guild-команды.
         try:
-            await bot.sync_application_commands(guild_id=None)  # чистка глобальных дублей
+            await bot.http.bulk_upsert_global_commands(app_id, [])
         except Exception as e:
-            logger.warning(f"Не удалось подчистить глобальные команды: {e}")
-        logger.info(f"⚡ Слэш-команды синхронизированы для серверов: {GUILD_IDS}")
+            logger.warning(f"Не удалось снести глобальные команды: {e}")
+        await bot.sync_all_application_commands()
+        logger.info(f"⚡ Слэш-команды синхронизированы для серверов: {GUILD_IDS} "
+                    f"(глобальные снесены — дублей не будет).")
     else:
+        # Глобальный режим: сносим залежавшиеся GUILD-команды на всех серверах с
+        # ботом (остались бы от прежнего guild-режима и двоились бы с глобальными),
+        # затем регистрируем глобально.
+        for g in list(bot.guilds):
+            try:
+                await bot.http.bulk_upsert_guild_commands(app_id, g.id, [])
+            except Exception as e:
+                logger.warning(f"Не удалось снести guild-команды на сервере {g.id}: {e}")
         await bot.sync_application_commands()
-        logger.info("🌐 Слэш-команды зарегистрированы глобально (обновление до ~1 часа).")
+        logger.info("🌐 Слэш-команды зарегистрированы глобально (обновление до ~1 часа; "
+                    "guild-дубли снесены).")
 
 
 @bot.event
@@ -731,20 +751,21 @@ async def on_application_command_error(interaction: nextcord.Interaction, error:
 
 # ── /help ─────────────────────────────────────────────────────────────────────
 
-@bot.slash_command(name='help', description="📖 Справка по командам бота")
+@bot.slash_command(name='help', description="📖 Справка: список команд и как ими пользоваться")
 async def help_command(interaction: nextcord.Interaction):
     embed = nextcord.Embed(
-        title="📖 Справка по боту Gelbooru v1.5",
+        title=f"📖 Справка по боту Gelbooru v{VERSION}",
         description="Список всех доступных команд:",
         color=0x3498db
     )
-    embed.add_field(name="🔞 /gelbooru <тег> [тег2] [тег3] [тег4]", value="Случайный арт/гиф/видео по 1-4 тегам с **Gelbooru**", inline=False)
-    embed.add_field(name="🔞 /konachan <тег> [тег2] [тег3] [тег4]", value="Случайный арт/гиф/видео по 1-4 тегам с **Konachan**", inline=False)
+    embed.add_field(name="🔞 /gelbooru <тег> [тег2] [тег3] [тег4]", value="Арт/гиф/видео по 1-4 тегам с **Gelbooru** — приоритет твоему запросу", inline=False)
+    embed.add_field(name="🔞 /konachan <тег> [тег2] [тег3] [тег4]", value="Арт/гиф/видео по 1-4 тегам с **Konachan** (аниме-арт)", inline=False)
+    embed.add_field(name="🟢 /safebooru <тег> [тег2] [тег3] [тег4]", value="Safe-арт по 1-4 тегам с **Safebooru** — без NSFW, работает в любом канале", inline=False)
     embed.add_field(name="🔞 /tg [канал]", value="Топовый по реакциям арт из **Telegram**-канала (отсев рекламы)", inline=False)
-    embed.add_field(name="🏷️ /tags", value="Показать доступные теги и их статус", inline=False)
-    embed.add_field(name="🔍 /tagcheck <тег>", value="Проверить наличие картинок по тегу", inline=False)
+    embed.add_field(name="🏷️ /tags", value="Показать популярные теги и их статус", inline=False)
+    embed.add_field(name="🔍 /tagcheck <тег>", value="Проверить, есть ли арты по тегу", inline=False)
     embed.add_field(name="📖 /help", value="Показать эту справку", inline=False)
-    embed.set_footer(text="💡 Используй /tags чтобы увидеть популярные теги!")
+    embed.set_footer(text="💡 NSFW-команды работают только в NSFW-каналах или в ЛС. /tags — список тегов.")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
@@ -761,7 +782,7 @@ async def _check_tag(http_session: aiohttp.ClientSession, tag: str) -> bool:
         return bool(posts)
 
 
-@bot.slash_command(name='tags', description="🏷️ Показать доступные теги")
+@bot.slash_command(name='tags', description="🏷️ Список популярных тегов и их статус (есть ли арты)")
 async def tags_list(interaction: nextcord.Interaction):
     if await reject_if_on_cooldown(interaction, TAGS_CD):
         return
@@ -818,8 +839,11 @@ async def tags_list(interaction: nextcord.Interaction):
 
 # ── /tagcheck ─────────────────────────────────────────────────────────────────
 
-@bot.slash_command(name='tagcheck', description="🔍 Проверить наличие картинок по тегу")
-async def tag_check(interaction: nextcord.Interaction, tag: str):
+@bot.slash_command(name='tagcheck', description="🔍 Проверить, есть ли на Gelbooru арты по тегу")
+async def tag_check(
+    interaction: nextcord.Interaction,
+    tag: str = nextcord.SlashOption(description="Тег для проверки", required=True),
+):
     if not channel_allows_nsfw(interaction):
         return await interaction.response.send_message("🔞 Пиздуй в NSFW канал!", ephemeral=True)
     if await reject_if_on_cooldown(interaction, TAGCHECK_CD):
@@ -1468,13 +1492,16 @@ async def run_booru_search(
         await safe_followup(interaction, "❌ Произошла внутренняя ошибка. Проверь консоль бота.")
 
 
-@bot.slash_command(name='gelbooru', description="🔞 Поиск артов на Gelbooru (до 4 тегов)")
+@bot.slash_command(
+    name='gelbooru',
+    description="🔞 Арт по тегам с Gelbooru — приоритет твоему запросу (до 4 тегов)",
+)
 async def gelbooru(
     interaction: nextcord.Interaction,
-    tag: str,
-    tag2: str = None,
-    tag3: str = None,
-    tag4: str = None,
+    tag: str = nextcord.SlashOption(description="Главный тег для поиска", required=True),
+    tag2: str = nextcord.SlashOption(description="Доп. тег для сужения (необязательно)", required=False, default=None),
+    tag3: str = nextcord.SlashOption(description="Доп. тег для сужения (необязательно)", required=False, default=None),
+    tag4: str = nextcord.SlashOption(description="Доп. тег для сужения (необязательно)", required=False, default=None),
 ):
     await run_booru_search(
         interaction, (tag, tag2, tag3, tag4),
@@ -1482,13 +1509,16 @@ async def gelbooru(
     )
 
 
-@bot.slash_command(name='konachan', description="🔞 Поиск артов на Konachan (до 4 тегов)")
+@bot.slash_command(
+    name='konachan',
+    description="🔞 Арт по тегам с Konachan — аниме-арт высокого качества (до 4 тегов)",
+)
 async def konachan(
     interaction: nextcord.Interaction,
-    tag: str,
-    tag2: str = None,
-    tag3: str = None,
-    tag4: str = None,
+    tag: str = nextcord.SlashOption(description="Главный тег для поиска", required=True),
+    tag2: str = nextcord.SlashOption(description="Доп. тег для сужения (необязательно)", required=False, default=None),
+    tag3: str = nextcord.SlashOption(description="Доп. тег для сужения (необязательно)", required=False, default=None),
+    tag4: str = nextcord.SlashOption(description="Доп. тег для сужения (необязательно)", required=False, default=None),
 ):
     await run_booru_search(
         interaction, (tag, tag2, tag3, tag4),
@@ -1496,13 +1526,16 @@ async def konachan(
     )
 
 
-@bot.slash_command(name='safebooru', description="🟢 Поиск артов на Safebooru (safe-контент, до 4 тегов)")
+@bot.slash_command(
+    name='safebooru',
+    description="🟢 Safe-арт по тегам с Safebooru — без NSFW, в любом канале (до 4 тегов)",
+)
 async def safebooru(
     interaction: nextcord.Interaction,
-    tag: str,
-    tag2: str = None,
-    tag3: str = None,
-    tag4: str = None,
+    tag: str = nextcord.SlashOption(description="Главный тег для поиска", required=True),
+    tag2: str = nextcord.SlashOption(description="Доп. тег для сужения (необязательно)", required=False, default=None),
+    tag3: str = nextcord.SlashOption(description="Доп. тег для сужения (необязательно)", required=False, default=None),
+    tag4: str = nextcord.SlashOption(description="Доп. тег для сужения (необязательно)", required=False, default=None),
 ):
     # Safe-контент → работает в любом канале и не требует наготы. Система
     # блокировки тегов (venti/lgbt/kanzaki/блэклист) — та же, что у /gelbooru.
@@ -1635,7 +1668,7 @@ async def run_tg_search(interaction: nextcord.Interaction, alias: str | None):
         await safe_followup(interaction, "❌ Произошла внутренняя ошибка. Проверь консоль бота.")
 
 
-@bot.slash_command(name="tg", description="🔞 Топовый по реакциям арт из Telegram-канала")
+@bot.slash_command(name="tg", description="🔞 Топовый по реакциям арт из Telegram-канала (реклама отсеивается)")
 async def tg_command(
     interaction: nextcord.Interaction,
     channel: str = nextcord.SlashOption(
