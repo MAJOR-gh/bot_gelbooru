@@ -117,5 +117,39 @@ check("ass req: bare-ass post passes",
 check("legacy (no override): bare-ass still passes",
       b.post_is_clean({"tags": "1girl ass"}) is True)
 
+print("== lead_by_score (Lawliet-style best-first) ==")
+LB = [
+    {"md5": "a", "tags": "1girl", "score": 10},
+    {"md5": "b", "tags": "1girl", "score": 99},
+    {"md5": "c", "tags": "1girl", "score": 50},
+]
+check("top score leads", b.lead_by_score(list(LB))[0]["md5"] == "b")
+check("keeps every art", len(b.lead_by_score(list(LB))) == 3)
+check("short list unchanged", b.lead_by_score(LB[:1]) == LB[:1])
+GF = {"breasts"}
+LBF = [
+    {"md5": "on_lo", "tags": "huge_breasts", "score": 5},     # tier 3, low score
+    {"md5": "on_hi", "tags": "large_breasts", "score": 40},   # tier 3, high score
+    {"md5": "off_hi", "tags": "ass_focus", "score": 999},     # tier 0, huge score
+]
+led = b.lead_by_score(b.focus_rerank(LBF, GF), GF)
+check("champion = best score within top focus tier", led[0]["md5"] == "on_hi")
+check("off-focus mega-score does NOT lead", led[0]["md5"] != "off_hi")
+
+print("== order_candidates (unseen-first, graceful LRS fallback) ==")
+from collections import deque as _dq
+P = [
+    {"md5": "x", "tags": "1girl", "score": 1},
+    {"md5": "y", "tags": "1girl", "score": 100},
+    {"md5": "z", "tags": "1girl", "score": 50},
+]
+check("all unseen -> champion first", b.order_candidates(list(P), _dq())[0]["md5"] == "y")
+oc = b.order_candidates(list(P), _dq(["y"]))
+check("seen art excluded", all(p["md5"] != "y" for p in oc))
+check("best of remaining leads", oc[0]["md5"] == "z")
+oc2 = b.order_candidates(list(P), _dq(["x", "y", "z"]))  # x appended first = oldest
+check("exhausted -> oldest-shown leads", oc2[0]["md5"] == "x")
+check("exhausted -> full pool returned", len(oc2) == 3)
+
 print(f"\n==== {passed} passed, {failed} failed ====")
 raise SystemExit(1 if failed else 0)

@@ -131,6 +131,7 @@ _BLACKLIST_TAGS = [
     "mindbreak", "mind_control",
     "ryona", "bdsm", "bondage", "gag", "dildo",
     "penetration", "anal_object_insertion", "anal_fingering", "anal_fisting",
+    "foot_focus", "goblin",
     "ai_generated",
     "armpit_hair", "pubic_hair", "body_hair", "chest_hair", "leg_hair", "hairy",
     "smegma",
@@ -1117,8 +1118,9 @@ def weighted_score_shuffle(posts: list[dict]) -> list[dict]:
 # ── Память недавно показанных артов (чтобы выдача не повторялась) ──────────────
 # Переживает рестарт: пишется в JSON на диск и грузится при старте. Иначе на
 # хостинге каждый редеплой/краш обнулял бы память и повторы возвращались с нуля.
-RECENT_MAX = 300        # сколько последних артов помним на каждый тег-запрос
+RECENT_MAX = 500        # сколько последних артов помним на каждый тег-запрос
 RECENT_MAX_KEYS = 500   # сколько тег-запросов держим, прежде чем вытеснять старые
+CANDIDATE_LIMIT = 50    # сколько кандидатов берём в работу после сортировки
 RECENT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "recent_shown.json")
 _recent_shown: dict[str, deque] = defaultdict(lambda: deque(maxlen=RECENT_MAX))
 
@@ -1182,6 +1184,53 @@ def dedup_posts(posts: list[dict]) -> list[dict]:
         seen.add(key)
         out.append(p)
     return out
+
+
+def lead_by_score(posts: list[dict], groups: set[str] | None = None) -> list[dict]:
+    """Ставит в голову списка лучший по score арт — как в Lawliet (показываем
+    самый залайканный из ещё не виденных). При запросе части тела champion берём
+    из верхнего focus-тира, иначе нерелевантный мега-хит обогнал бы релевантные.
+    Хвост не трогаем: там остаётся focus-порядок и weighted-разнообразие.
+    """
+    if len(posts) < 2:
+        return posts
+    if groups:
+        top = _focus_tier(posts[0], groups)          # pool уже отсортирован по тиру
+        eligible = [i for i, p in enumerate(posts) if _focus_tier(p, groups) == top]
+    else:
+        eligible = range(len(posts))
+    best = max(eligible, key=lambda i: int(posts[i].get("score", 0) or 0))
+    if best == 0:
+        return posts
+    return [posts[best], *posts[:best], *posts[best + 1:]]
+
+
+def order_candidates(pool: list[dict], recent, groups: set[str] | None = None) -> list[dict]:
+    """Финальный порядок кандидатов к показу:
+      • ещё не показанные — впереди, лучший по score в голове (Lawliet-style);
+      • если показано всё (свежих нет) — мягкая деградация: арты, виденные давно,
+        идут раньше недавних повторов; score — вторичный критерий.
+    Память (recent) — deque uid'ов в порядке показа; проверка O(1) через set
+    (у deque оператор `in` линейный, на окне в сотни артов это заметно).
+    """
+    seen = set(recent)
+    unseen = [p for p in pool if post_uid(p) not in seen]
+    if unseen:
+        return lead_by_score(unseen, groups)
+    age = {uid: i for i, uid in enumerate(recent)}   # меньший индекс = показывали давнее
+    return sorted(pool, key=lambda p: (age.get(post_uid(p), -1),
+                                       -int(p.get("score", 0) or 0)))
+
+
+def remember_shown(rkey: str, uid: str) -> None:
+    """Запоминаем показанный арт: добавляем в окно, двигаем ключ в конец (псевдо-LRU)
+    и атомарно пишем на диск — память переживает рестарт хостинга.
+    """
+    recent = _recent_shown[rkey]
+    recent.append(uid)
+    _recent_shown.pop(rkey, None)
+    _recent_shown[rkey] = recent
+    save_recent_shown()
 
 
 # ── Ротация страниц: немного разнообразия без потери качества ──────────────────
@@ -1445,14 +1494,11 @@ async def run_booru_search(
                 f"❌ По тегу `{display_tag}` на {label} ничего не найдено."
             )
 
-        # Исключаем недавно показанные арты по этому тегу. Если так пул опустел
-        # (всё уже видели) — сбрасываем фильтр, чтобы не отвечать «не найдено».
+        # Кандидаты к показу: ещё не виденные впереди (лучший по score — первым,
+        # как в Lawliet), а если всё уже показано — деградируем к давно виденным,
+        # чтобы не повторять только что отправленное.
         rkey = recent_key(label, tags_clean)
-        recent = _recent_shown[rkey]
-        fresh = [p for p in pool if post_uid(p) not in recent]
-        pool = fresh or pool
-
-        candidates = pool[:50]
+        candidates = order_candidates(pool, _recent_shown[rkey], requested_groups)[:CANDIDATE_LIMIT]
 
         max_size = max_upload_size(interaction)
 
@@ -1468,10 +1514,7 @@ async def run_booru_search(
                     embed=payload["embed"],
                     file=payload["file"],
                 )
-                recent.append(post_uid(payload["_post"]))  # запомнили показанное
-                _recent_shown.pop(rkey, None)  # двигаем ключ в конец словаря (LRU)
-                _recent_shown[rkey] = recent
-                save_recent_shown()            # переживёт рестарт хостинга
+                remember_shown(rkey, post_uid(payload["_post"]))  # запомнили + LRU + на диск
                 break
             except nextcord.HTTPException as e:
                 if getattr(e, "status", None) == 413:
@@ -1628,11 +1671,7 @@ async def run_tg_search(interaction: nextcord.Interaction, alias: str | None):
         # Порог реакций (мягко опускается) → взвешенный рандом → память показанных.
         pool = weighted_score_shuffle(quality_floor(raw, TG_REACTION_FLOORS))
         rkey = recent_key(label, [chosen["alias"]])
-        recent = _recent_shown[rkey]
-        fresh = [p for p in pool if post_uid(p) not in recent]
-        pool = fresh or pool
-
-        candidates = pool[:50]
+        candidates = order_candidates(pool, _recent_shown[rkey])[:CANDIDATE_LIMIT]
         max_size = max_upload_size(interaction)
 
         payload = None
@@ -1647,7 +1686,7 @@ async def run_tg_search(interaction: nextcord.Interaction, alias: str | None):
                 sent_msg = await interaction.followup.send(
                     content=payload["content"], embed=payload["embed"], file=payload["file"]
                 )
-                recent.append(post_uid(payload["_post"]))
+                remember_shown(rkey, post_uid(payload["_post"]))  # +персист (раньше терялось при рестарте)
                 break
             except nextcord.HTTPException as e:
                 if getattr(e, "status", None) == 413:
