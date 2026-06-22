@@ -130,6 +130,7 @@ _BLACKLIST_TAGS = [
     "netorare", "ntr", "cheating", "cuckold",
     "mindbreak", "mind_control",
     "ryona", "bdsm", "bondage", "gag", "dildo",
+    "penetration", "anal_object_insertion", "anal_fingering", "anal_fisting",
     "ai_generated",
     "armpit_hair", "pubic_hair", "body_hair", "chest_hair", "leg_hair", "hairy",
     "smegma",
