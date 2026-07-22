@@ -763,7 +763,7 @@ async def help_command(interaction: nextcord.Interaction):
     embed.add_field(name="🔞 /gelbooru <тег> [тег2] [тег3] [тег4]", value="Арт/гиф/видео по 1-4 тегам с **Gelbooru** — приоритет твоему запросу", inline=False)
     embed.add_field(name="🔞 /konachan <тег> [тег2] [тег3] [тег4]", value="Арт/гиф/видео по 1-4 тегам с **Konachan** (аниме-арт)", inline=False)
     embed.add_field(name="🟢 /safebooru <тег> [тег2] [тег3] [тег4]", value="Safe-арт по 1-4 тегам с **Safebooru** — без NSFW, работает в любом канале", inline=False)
-    embed.add_field(name="🔞 /tg [канал]", value="Топовый по реакциям арт из **Telegram**-канала (отсев рекламы)", inline=False)
+    embed.add_field(name="🔞 /tg [канал]", value="Арт из **Telegram**-канала — весь пост (все картинки и видео)", inline=False)
     embed.add_field(name="🏷️ /tags", value="Показать популярные теги и их статус", inline=False)
     embed.add_field(name="🔍 /tagcheck <тег>", value="Проверить, есть ли арты по тегу", inline=False)
     embed.add_field(name="📖 /help", value="Показать эту справку", inline=False)
@@ -1163,7 +1163,14 @@ def save_recent_shown() -> None:
 
 
 def post_uid(post: dict) -> str:
-    """Стабильный идентификатор арта (md5, иначе сайт+id)."""
+    """Стабильный идентификатор арта (md5, иначе сайт+id).
+
+    Для Telegram-альбомов источник кладёт общий `_uid` (по grouped_id), чтобы
+    анти-повтор считал весь пост за один арт и не показывал его повторно.
+    """
+    uid = post.get("_uid")
+    if uid:
+        return uid
     md5 = (post.get("md5") or "").lower()
     return md5 or f"{post.get('_site')}:{post.get('id')}"
 
@@ -1592,37 +1599,78 @@ async def safebooru(
 
 # ── /tg — арты из Telegram-каналов ─────────────────────────────────────────────
 
-async def build_tg_payload(post: dict, max_size: int) -> dict | None:
-    """Скачивает медиа TG-поста и готовит payload для отправки в Discord."""
-    msg = post["_msg"]
-    data, size, reason = await tg_source.download_media(tg_client, msg, max_size)
-    if not data:
-        return None  # слишком большой или ошибка — пробуем следующего
+# Discord принимает максимум 10 вложений в одном сообщении.
+DISCORD_MAX_FILES = 10
 
-    ext = tg_source.media_ext(msg)
-    is_video = ext in ("mp4", "webm", "gif")
-    filename = f"tg_{post['_alias']}_{post['id']}.{ext}".replace("..", ".")
-    bio = BytesIO(data)
-    bio.seek(0)
-    file = nextcord.File(bio, filename=filename)
+
+def _is_video_msg(m) -> bool:
+    """True, если сообщение TG — видео/гиф (по расширению файла)."""
+    return tg_source.media_ext(m) in ("mp4", "webm", "mov", "m4v", "gif")
+
+
+async def build_tg_payload(post: dict, max_size: int) -> dict | None:
+    """Готовит пост целиком к отправке в Discord: все картинки и видео поста.
+
+    Медиа складываются в исходном порядке, пока укладываются в лимит Discord на
+    ВСЁ сообщение (не на отдельный файл). Не влезшие файлы или слишком тяжёлое
+    видео обозначаются ссылкой «Открыть пост» — так пост не теряется целиком.
+    """
+    msg = post["_msg"]
+    peer = post.get("_peer")
+    album_msgs = await tg_source.fetch_album_messages(tg_client, peer, msg) if peer else [msg]
+
+    media_msgs = [m for m in album_msgs if tg_source.has_visual_media(m)]
+    if not media_msgs:
+        return None
+
+    has_video = any(_is_video_msg(m) for m in media_msgs)
+    files = []
+    total_size = 0
+    skipped = 0
+    for m in media_msgs:
+        if len(files) >= DISCORD_MAX_FILES:
+            skipped += 1
+            continue
+        remaining = max_size - total_size
+        # Заранее отсекаем то, что заведомо не влезет в остаток лимита сообщения.
+        f = getattr(m, "file", None)
+        approx = getattr(f, "size", None) if f else None
+        if approx and approx > remaining:
+            skipped += 1
+            continue
+        data, size, reason = await tg_source.download_media(tg_client, m, remaining)
+        if not data:
+            skipped += 1
+            continue
+        ext = tg_source.media_ext(m)
+        filename = f"tg_{post['_alias']}_{m.id}.{ext}".replace("..", ".")
+        bio = BytesIO(data)
+        bio.seek(0)
+        files.append(nextcord.File(bio, filename=filename))
+        total_size += size
 
     link = tg_source.post_link(post)
     reactions = post.get("score", 0)
-    if is_video:
-        parts = [f"🎬 **{post['_alias']}** • ❤️ {reactions} • {size / (1024*1024):.1f} MB"]
-        if link:
-            parts.append(f"[Открыть пост]({link})")
-        return {"content": " • ".join(parts), "embed": None, "file": file, "_post": post}
+    icon = "🎬" if has_video else "🖼"
 
-    embed = nextcord.Embed(title="🖼 Арт из Telegram", color=0x229ED9)
-    embed.add_field(name="📡 Канал", value=str(post["_alias"]), inline=True)
-    embed.add_field(name="❤️ Реакции", value=str(reactions), inline=True)
-    embed.add_field(name="📏 Размер", value=f"{size / (1024*1024):.1f} MB", inline=True)
+    # Не влезло ничего, но медиа в посте было (тяжёлое видео/крупный альбом) —
+    # отдаём подпись + ссылку, чтобы пост не пропал совсем.
+    if not files:
+        if not link:
+            return None
+        parts = [f"{icon} **{post['_alias']}** • ❤️ {reactions}",
+                 "⬆️ файлы слишком большие — смотри в источнике",
+                 f"[Открыть пост]({link})"]
+        return {"content": " • ".join(parts), "embed": None, "files": [], "_post": post}
+
+    parts = [f"{icon} **{post['_alias']}** • ❤️ {reactions}"]
+    if len(files) > 1:
+        parts.append(f"📎 {len(files)} файлов")
+    if skipped:
+        parts.append(f"➕ ещё {skipped} в посте")
     if link:
-        embed.add_field(name="🔗 Ссылка", value=f"[Открыть пост]({link})", inline=False)
-    embed.set_image(url=f"attachment://{filename}")
-    embed.set_footer(text=f"Telegram • {post['_alias']} • ID {post['id']}")
-    return {"content": None, "embed": embed, "file": file, "_post": post}
+        parts.append(f"[Открыть пост]({link})")
+    return {"content": " • ".join(parts), "embed": None, "files": files, "_post": post}
 
 
 async def run_tg_search(interaction: nextcord.Interaction, alias: str | None):
@@ -1684,7 +1732,7 @@ async def run_tg_search(interaction: nextcord.Interaction, alias: str | None):
             attempts += 1
             try:
                 sent_msg = await interaction.followup.send(
-                    content=payload["content"], embed=payload["embed"], file=payload["file"]
+                    content=payload["content"], embed=payload["embed"], files=payload["files"]
                 )
                 remember_shown(rkey, post_uid(payload["_post"]))  # +персист (раньше терялось при рестарте)
                 break
@@ -1708,7 +1756,7 @@ async def run_tg_search(interaction: nextcord.Interaction, alias: str | None):
         await safe_followup(interaction, "❌ Произошла внутренняя ошибка. Проверь консоль бота.")
 
 
-@bot.slash_command(name="tg", description="🔞 Топовый по реакциям арт из Telegram-канала (реклама отсеивается)")
+@bot.slash_command(name="tg", description="🔞 Арт из телеграм канала")
 async def tg_command(
     interaction: nextcord.Interaction,
     channel: str = nextcord.SlashOption(

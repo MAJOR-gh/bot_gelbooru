@@ -151,6 +151,10 @@ async def fetch_channel_arts(client: TelegramClient, alias: str, peer: str,
         async for msg in client.iter_messages(peer_val, limit=limit):
             if post_is_ad(msg):
                 continue
+            # Альбом = один арт: общий uid по grouped_id, чтобы анти-повтор не
+            # показывал те же картинки повторно через другого участника альбома.
+            gid = getattr(msg, "grouped_id", None)
+            uid = f"TG:{alias}:g{gid}" if gid else f"TG:{alias}:{msg.id}"
             posts.append({
                 "id": msg.id,
                 "score": reaction_count(msg),
@@ -158,6 +162,8 @@ async def fetch_channel_arts(client: TelegramClient, alias: str, peer: str,
                 "_alias": alias,
                 "_username": username,
                 "_peer_id": peer_id,
+                "_peer": peer_val,
+                "_uid": uid,
                 "_msg": msg,
                 "caption": (getattr(msg, "message", None) or "")[:200],
             })
@@ -186,6 +192,19 @@ async def download_media(client: TelegramClient, msg, max_size: int):
     if len(data) > max_size:
         return None, len(data), "too_big"
     return data, len(data), None
+
+
+async def fetch_album_messages(client: TelegramClient, peer, msg) -> list:
+    """Вернуть все сообщения альбома (grouped_id), или [msg] если пост одиночный."""
+    grouped_id = getattr(msg, "grouped_id", None)
+    if not grouped_id:
+        return [msg]
+    msgs = []
+    async for m in client.iter_messages(peer, min_id=msg.id - 20, max_id=msg.id + 20):
+        if getattr(m, "grouped_id", None) == grouped_id:
+            msgs.append(m)
+    msgs.sort(key=lambda m: m.id)  # хронологический порядок, как в исходном посте
+    return msgs or [msg]
 
 
 def media_ext(msg) -> str:
