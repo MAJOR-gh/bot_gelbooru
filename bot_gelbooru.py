@@ -357,9 +357,26 @@ def post_is_clean(post: dict, allowed: set[str] | None = None,
     # 1. HARD-блок — точные теги
     if not low_tags.isdisjoint(HARD_SET):
         return False
-    # 1b + 2. HARD/возрастные/AI — по подстрокам
+    # 1b. HARD — по токенам (точное совпадение токена, а не подстрока),
+    # чтобы не блочить легитимные теги вроде futaba_sakura (содержит futa).
     for tag in low_tags:
-        if any(h in tag for h in HARD_SUBSTRINGS):
+        tokens = set(tag.replace("-", "_").split("_"))
+        blocked_hard = False
+        for h in HARD_SUBSTRINGS:
+            hl = h.lower().replace("-", "_").strip("_")
+            if not hl:
+                continue
+            if "_" in hl:
+                # Фраза из нескольких токенов (otoko_no_ko, ball_gag) — ловим подстрокой
+                if hl in tag:
+                    blocked_hard = True
+                    break
+            else:
+                # Одиночный токен — только точное совпадение токена
+                if hl in tokens:
+                    blocked_hard = True
+                    break
+        if blocked_hard:
             return False
         if any(crit in tag for crit in CRITICAL_SET):
             return False
@@ -461,7 +478,7 @@ def tag_is_kanzaki_hideri(clean_tag: str) -> bool:
 def tag_is_blocked(clean_tag: str) -> bool:
     """True если тег пользователя запрещён — такой контент не показываем вообще."""
     low = clean_tag.lower()
-    tokens = set(low.split("_"))
+    tokens = set(low.replace("-", "_").split("_"))
     # Явные пользовательские блок-теги (точное совпадение токена)
     if low in BLOCKED_USER_TAGS or not tokens.isdisjoint(BLOCKED_USER_TAGS):
         return True
@@ -469,12 +486,24 @@ def tag_is_blocked(clean_tag: str) -> bool:
     # — точное совпадение (без токен-сплита, чтобы не ловить cat_ears/animal_ears).
     if low in BLACKLIST_SET:
         return True
-    # Возрастные / AI / HARD — по подстрокам, ловим любые вариации
+    # Возрастные / AI — по подстрокам, ловим любые вариации
     if any(c in low for c in CRITICAL_SET):
         return True
     if any(a in low for a in AI_SUBSTRINGS):
         return True
-    return any(h in low for h in HARD_SUBSTRINGS)
+    # HARD — токен-точное совпадение (не подстрока), чтобы не блочить
+    # легитимные теги вроде futaba_sakura (содержит futa как подстроку).
+    for h in HARD_SUBSTRINGS:
+        hl = h.lower().replace("-", "_").strip("_")
+        if not hl:
+            continue
+        if "_" in hl:
+            if hl in low:
+                return True
+        else:
+            if hl in tokens:
+                return True
+    return False
 
 
 # ── Популярные теги ───────────────────────────────────────────────────────────

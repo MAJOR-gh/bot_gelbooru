@@ -25,10 +25,13 @@ check("xml parse", b.parse_posts('<posts><post id="5" file_url="x"/></posts>')[0
 check("garbage -> None", b.parse_posts("not json not xml") is None)
 
 print("== post_is_clean ==")
-check("clean post", b.post_is_clean({"tags": "1girl blue_hair smile"}) is True)
+check("clean post", b.post_is_clean({"tags": "1girl blue_hair smile nude"}) is True)
+check("clean post without nudity rejected", b.post_is_clean({"tags": "1girl blue_hair smile"}) is False)
+check("clean post without nudity allowed when flag off", b.post_is_clean({"tags": "1girl blue_hair smile"}, require_nudity=False) is True)
 check("dirty post (loli)", b.post_is_clean({"tags": "1girl loli"}) is False)
 check("dirty post (gore)", b.post_is_clean({"tags": "blood gore wound"}) is False)
-check("empty tags -> clean", b.post_is_clean({}) is True)
+check("empty tags -> not clean when nudity required", b.post_is_clean({}) is False)
+check("empty tags -> clean when nudity not required", b.post_is_clean({}, require_nudity=False) is True)
 
 print("== tag_is_blocked (exact token, no false positives) ==")
 check("futa blocked", b.tag_is_blocked("futa") is True)
