@@ -1,65 +1,78 @@
-import nextcord
-from nextcord.ext import commands
-import aiohttp
-import random
-import os
-import json
-import time
-import asyncio
+"""Gelbooru Discord-бот: /gelbooru /konachan /safebooru /tg /tags /tagcheck /help.
+
+Модули:
+  content_filter — что можно показывать (блэклисты, нагота, фокус части тела);
+  booru          — сайты, поиск по страницам, скачивание;
+  selection      — анти-повтор и порядок кандидатов;
+  tg_source      — Telegram-каналы (userbot на Telethon).
+"""
 import logging
-import xml.etree.ElementTree as ET
+import os
+import random
+import time
 from collections import defaultdict, deque
 from io import BytesIO
+
+import nextcord
+from dotenv import load_dotenv
 from nextcord.errors import NotFound
+from nextcord.ext import commands
 
-import tg_source
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# .env рядом с ботом (панели-хостинги не всегда дают задать переменные).
+# Уже заданные переменные окружения не перетираются.
+load_dotenv(os.path.join(BASE_DIR, ".env"))
 
-# Настройка логов
+# Эти модули читают env при импорте — поэтому после load_dotenv.
+import booru  # noqa: E402
+import content_filter as cf  # noqa: E402
+import tg_source  # noqa: E402
+from selection import ShownMemory, order_candidates, post_uid, recent_key  # noqa: E402
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
+    datefmt='%Y-%m-%d %H:%M:%S',
 )
 logger = logging.getLogger('gelbooru_bot')
 
-# Единый источник версии (раньше «1.5» был зашит в логах и /help и отставал).
-VERSION = "2.5"
+VERSION = "3.0"
 
-# ID серверов для МГНОВЕННОЙ регистрации слэш-команд. Guild-команды Discord
-# применяет сразу, глобальные — до часа. Несколько ID — через запятую.
-# Пусто/не задано → глобальная регистрация (прежнее поведение).
+
+def env_any(*names: str) -> str | None:
+    """Первое непустое значение среди нескольких имён переменных окружения."""
+    for n in names:
+        v = os.environ.get(n)
+        if v and v.strip():
+            return v.strip()
+    return None
+
+
+# ID серверов для МГНОВЕННОЙ регистрации слэш-команд (через запятую).
+# Пусто → глобальная регистрация (Discord обновляет до часа).
 GUILD_IDS = [
-    int(g) for g in os.environ.get("DISCORD_GUILD_IDS", "").replace(";", ",").split(",")
+    int(g) for g in (os.environ.get("DISCORD_GUILD_IDS") or "").replace(";", ",").split(",")
     if g.strip().isdigit()
 ]
 
-intents = nextcord.Intents.default()
-bot = commands.Bot(intents=intents, default_guild_ids=GUILD_IDS or None)
+# Где хранить память показанных артов (на хостинге — постоянный диск).
+DATA_DIR = os.environ.get("DATA_DIR") or BASE_DIR
+memory = ShownMemory(os.path.join(DATA_DIR, "recent_shown.json"))
 
-# Глобальная сессия для HTTP запросов
-session: aiohttp.ClientSession = None
+GELBOORU = booru.Gelbooru(env_any("GELBOORU_API_KEY"), env_any("GELBOORU_USER_ID"))
+KONACHAN = booru.Konachan()
+SAFEBOORU = booru.Safebooru()
 
-# Таймауты
-API_TIMEOUT = aiohttp.ClientTimeout(total=15, connect=5)
-IMG_TIMEOUT = aiohttp.ClientTimeout(total=30, connect=5)
-HEAD_TIMEOUT = aiohttp.ClientTimeout(total=5, connect=5)
+TG_API_ID = env_any("TG_API_ID", "API_ID", "TELEGRAM_API_ID", "TG_ID")
+TG_API_HASH = env_any("TG_API_HASH", "API_HASH", "TELEGRAM_API_HASH", "TG_HASH")
+tg_client = None  # Telethon-клиент; поднимается в on_ready, None если ключи не заданы
 
-# Семафор для /tags (параллельные запросы, не более 5 одновременно)
-TAGS_SEMAPHORE = asyncio.Semaphore(5)
-
-
-async def get_session() -> aiohttp.ClientSession:
-    """Получить или создать глобальную сессию (создаётся внутри event loop)."""
-    global session
-    if session is None or session.closed:
-        connector = aiohttp.TCPConnector(limit=40, ttl_dns_cache=300)
-        session = aiohttp.ClientSession(connector=connector)
-    return session
+bot = commands.Bot(intents=nextcord.Intents.default(), default_guild_ids=GUILD_IDS or None)
 
 
 # ── Кулдауны (nextcord-слэш-команды НЕ поддерживают commands.cooldown) ─────────
 class CooldownManager:
-    """Простой sliding-window кулдаун: не более `rate` вызовов за `per` секунд."""
+    """Sliding-window кулдаун: не более `rate` вызовов за `per` секунд."""
 
     def __init__(self, rate: int, per: float):
         self.rate = rate
@@ -78,29 +91,30 @@ class CooldownManager:
         return 0.0
 
 
-# Поисковые кулдауны: 5 запросов за 30 сек = в среднем 1 поиск раз в 6 секунд
-# на пользователя (с небольшим допуском на всплеск).
+# 5 поисков за 30 сек ≈ 1 поиск раз в 6 секунд на пользователя (с запасом на всплеск).
 GELBOORU_CD = CooldownManager(rate=5, per=30.0)
 KONACHAN_CD = CooldownManager(rate=5, per=30.0)
 SAFEBOORU_CD = CooldownManager(rate=5, per=30.0)
+TG_CD = CooldownManager(rate=3, per=30.0)
 TAGS_CD = CooldownManager(rate=1, per=30.0)
 TAGCHECK_CD = CooldownManager(rate=5, per=30.0)
 
 
 async def reject_if_on_cooldown(interaction: nextcord.Interaction, cd: CooldownManager) -> bool:
-    """Если пользователь на кулдауне — отправляет сообщение и возвращает True."""
+    """Если пользователь на кулдауне — отвечает и возвращает True."""
     retry = cd.retry_after(interaction.user.id)
     if retry > 0:
         await interaction.response.send_message(
-            f"⏳ Слишком часто! Попробуй снова через **{retry:.0f}с**.",
-            ephemeral=True,
-        )
+            f"⏳ Слишком часто! Попробуй снова через **{retry:.0f}с**.", ephemeral=True)
         return True
     return False
 
 
+NSFW_ONLY = "🔞 Пиздуй в NSFW канал!"
+
+
 def channel_allows_nsfw(interaction: nextcord.Interaction) -> bool:
-    """NSFW разрешён в личке и в NSFW-каналах."""
+    """NSFW разрешён в личке и в NSFW-каналах (в ветке — по родительскому каналу)."""
     channel = interaction.channel
     if isinstance(channel, nextcord.DMChannel):
         return True
@@ -113,323 +127,31 @@ def channel_allows_nsfw(interaction: nextcord.Interaction) -> bool:
     return False
 
 
-# ── Блэклист ────────────────────────────────────────────────────────────────
-_BLACKLIST_TAGS = [
-    "loli", "shota", "underage", "young", "child", "aged_down",
-    "gore", "blood", "snuff", "rape", "abuse", "vore",
-    "torture", "mutilation",
-    "tentacles", "bestiality", "zoophilia", "inflation",
-    "piss", "pee", "peeing", "urine",
-    "fart", "toilet", "diaper", "pregnancy", "pregnant", "birth", "group_sex",
-    "furry", "anthro", "animal", "dog", "cat", "horse", "fox",
-    "the_simpsons", "bart_simpson", "homer_simpson",
-    "pokemon", "pikachu", "my_little_pony", "mlp", "steven_universe",
-    "family_guy", "south_park", "rugrats", "disney", "cartoon",
-    "3d",
-    "futa", "futanari", "trap", "crossdressing", "femboy",
-    "netorare", "ntr", "cheating", "cuckold",
-    "mindbreak", "mind_control",
-    "ryona", "bdsm", "bondage", "gag", "dildo",
-    "penetration", "anal_object_insertion", "anal_fingering", "anal_fisting",
-    "foot_focus", "goblin",
-    "ai_generated",
-    "armpit_hair", "pubic_hair", "body_hair", "chest_hair", "leg_hair", "hairy",
-    "smegma",
-    "ugly", "ugly_man", "ugly_bastard", "old_man",
-    "fat", "obese", "overweight",
-    "stubble",
-    "vomit", "puke", "crying",
-    "forced",
-    "huge_belly", "saggy_breasts", "wrinkles",
-    "bad_anatomy", "bad_hands", "bad_feet", "bad_face",
-    "cuntboy", "gay", "lesbian", "dark-skinned_male",
-    "male/male",
-    "orc",
-    # ── низкое качество / трешак (локальный отсев, не навязывает типаж) ──
-    "lowres", "sketch", "wip", "unfinished", "jpeg_artifacts",
-    "bad_proportions", "poorly_drawn", "scan", "what",
-    "old_woman", "granny",
-]
-
-# Строка отрицательных тегов для API-запроса ("-tag -tag2 ...")
-BLACKLIST = " ".join(f"-{t}" for t in _BLACKLIST_TAGS)
-
-# Set для быстрой локальной фильтрации — O(1) lookup
-BLACKLIST_SET: set[str] = set(_BLACKLIST_TAGS)
-
-# ── КРИТИЧЕСКИЙ блэклист (возрастные теги) ────────────────────────────────────
-# Эти теги ВСЕГДА уходят в запрос к API (короткий список — НЕ вызывает 413),
-# чтобы Gelbooru отсекал их на сервере, а не только локально.
-_CRITICAL_TAGS = [
-    "loli", "shota", "lolicon", "shotacon", "toddlercon",
-    "underage", "child", "aged_down", "young",
-]
-CRITICAL_BLACKLIST = " ".join(f"-{t}" for t in _CRITICAL_TAGS)
-# Локальная подстраховка: ловим и подстроки (loli внутри loli_dominance и т.п.)
-CRITICAL_SET: set[str] = set(_CRITICAL_TAGS)
-
-# ── AI / нейроарты ────────────────────────────────────────────────────────────
-# Основной тег Gelbooru пишется через ДЕФИС ("ai-generated"). Шлём в API всегда
-# (короткий список, 413 не вызовет) + локальная подстраховка по подстрокам.
-_AI_TAGS = [
-    "ai-generated", "ai-created", "ai-assisted", "ai_generated",
-]
-AI_BLACKLIST = " ".join(f"-{t}" for t in _AI_TAGS)
-# Для локальной фильтрации сводим к корням, чтобы ловить любые вариации
-AI_SUBSTRINGS = ("ai-generated", "ai_generated", "ai-created", "ai_art",
-                 "stable_diffusion", "novelai", "nai_diffusion", "midjourney",
-                 "dall-e", "dalle")
-
-# ── HARD-блок: яой / мужской контент / фембои / бондаж / БДСМ ──────────────────
-# СТРОГО запрещено и НЕотключаемо (даже если юзер укажет такой тег явно).
-# Уходит в каждый API-запрос + ловится локально (точные теги и подстроки).
-_HARD_TAGS = [
-    # яой / мужской контент
-    "yaoi", "bara", "gay", "male_only", "multiple_boys", "2boys", "3boys",
-    "male/male", "boy_on_top", "male_focus", "1boy", "cum_on_male",
-    # фембои / трапы / переодевание
-    "femboy", "trap", "crossdressing", "otoko_no_ko", "cuntboy", "tomgirl",
-    "astolfo_(fate)", "astolfo", "felix_argyle",
-    # футанари
-    "futanari", "futa", "futa_on_male", "newhalf", "dickgirl",
-    # бондаж / БДСМ / насилие в кадре
-    "bdsm", "bondage", "shibari", "rope_bondage", "gag", "ball_gag",
-    "ring_gag", "tape_gag", "collar", "leash", "chained", "shackles",
-    "spanking", "whip", "flogger", "torture", "ryona",
-    # страпон / пеггинг
-    "strap-on", "strapon",
-]
-HARD_BLACKLIST = " ".join(f"-{t}" for t in _HARD_TAGS)
-HARD_SET: set[str] = set(_HARD_TAGS)
-# Подстроки для локальной ловли вариаций (yaoi_*, *_bondage, ball_gag и т.п.)
-HARD_SUBSTRINGS = (
-    "yaoi", "bara", "femboy", "futanari", "futa", "crossdress",
-    "otoko_no_ko", "cuntboy", "bondage", "bdsm", "shibari", "_gag", "gag_",
-    "ball_gag", "ring_gag", "leash", "shackle", "ryona",
-    "strap-on", "strapon",
-)
-
-# ── Требование наготы ─────────────────────────────────────────────────────────
-# Пост проходит, ТОЛЬКО если содержит хотя бы один из этих тегов (полная или
-# частичная нагота). Так отсекаются полностью одетые арты.
-NUDITY_TAGS: set[str] = {
-    "nude", "completely_nude", "topless", "bottomless", "naked",
-    "nipples", "breasts_out", "no_bra", "no_panties", "pussy",
-    "uncensored", "exposed_breasts", "bare_breasts", "areola_slip",
-    "nipple_slip", "covered_nipples", "clothing_aside", "bottomless_female",
-    "open_clothes", "undressing", "partially_undressed", "clothes_lift",
-    "skirt_lift", "shirt_lift", "bra", "panties", "lingerie", "underwear",
-    "see-through", "wardrobe_malfunction", "cum", "sex", "vaginal", "anal",
-    "fellatio", "paizuri", "cameltoe", "ass", "thong",
-}
-# Явная «полная одежда» — локально отбрасываем такие посты.
-DRESSED_TAGS: set[str] = {"fully_clothed", "fully_dressed", "dressed"}
+# ── Лимит загрузки ────────────────────────────────────────────────────────────
+MB = 1024 * 1024
+UPLOAD_MARGIN = 512 * 1024  # запас на embed и обёртку multipart
+_cap = env_any("MAX_UPLOAD_MB")
+UPLOAD_CAP = int(_cap) * MB if _cap and _cap.isdigit() else None
 
 
-# ── Фокус по части тела: приоритет запрошенного, демоция «не того» сюжета ──────
-# Юзер ищет breasts, но в топе по score часто арт, где сюжет — ass/pussy, а тег
-# breasts лишь присутствует. Поднимаем посты, где сюжет = запрошенная часть, и
-# опускаем те, где сюжет — часть, которую НЕ просили. Имена тегов сверены по
-# Gelbooru API: emphasis-семья (large/huge_breasts, cleavage, nipples…) надёжнее
-# редких *_focus (breast_focus ~6k, pussy_focus ~1k постов).
-
-# «Конкурирующие» телесные nudity-теги: голая жопа/писька сама по себе НЕ должна
-# засчитывать наготу для запроса breasts. Раздаются по группам ниже.
-_BODYPART_NUDITY: set[str] = {"pussy", "cameltoe", "ass", "thong", "anus"}
-# Общая нагота (не привязана к конкретной части). Для не-телесных запросов
-# используется весь NUDITY_TAGS (как раньше).
-GENERAL_NUDITY: set[str] = NUDITY_TAGS - _BODYPART_NUDITY
-
-FOCUS_GROUPS: dict[str, dict[str, set[str]]] = {
-    "breasts": {
-        # тег юзера → активирует эту группу как «запрошенную»
-        "triggers": {"breasts", "large_breasts", "huge_breasts", "gigantic_breasts",
-                     "medium_breasts", "small_breasts", "cleavage", "underboob",
-                     "sideboob", "paizuri", "oppai", "boobs"},
-        # сюжет поста = грудь (emphasis / close-up / захват)
-        "focus": {"large_breasts", "huge_breasts", "gigantic_breasts", "medium_breasts",
-                  "cleavage", "underboob", "sideboob", "paizuri", "breasts_out",
-                  "between_breasts", "breast_focus", "cleavage_cutout", "breast_grab",
-                  "breast_press", "breast_hold", "nipples", "bare_breasts",
-                  "exposed_breasts", "oppai"},
-        # засчитывается как нагота при запросе груди
-        "nudity": {"nipples", "breasts_out", "bare_breasts", "exposed_breasts",
-                   "no_bra", "paizuri", "areola_slip", "nipple_slip"},
-    },
-    "ass": {
-        "triggers": {"ass", "huge_ass", "big_ass", "large_ass", "ass_focus",
-                     "anus", "butt", "booty"},
-        "focus": {"huge_ass", "big_ass", "large_ass", "ass_focus", "from_behind",
-                  "bent_over", "spread_ass", "top-down_bottom-up", "backboob",
-                  "ass_visible_through_thighs", "anus", "ass_grab"},
-        "nudity": {"ass", "anus", "thong"},
-    },
-    "pussy": {
-        "triggers": {"pussy", "vagina", "vaginal", "spread_pussy", "clitoris",
-                     "cameltoe"},
-        "focus": {"spread_pussy", "pussy_focus", "clitoris", "pussy_juice",
-                  "cameltoe", "female_ejaculation", "after_vaginal", "gaping"},
-        "nudity": {"pussy", "cameltoe"},
-    },
-    "feet": {
-        "triggers": {"feet", "foot", "feet_focus", "foot_focus", "soles", "toes",
-                     "footjob", "barefoot"},
-        "focus": {"feet_focus", "foot_focus", "soles", "toes", "footjob",
-                  "foot_worship"},
-        "nudity": set(),
-    },
-}
-
-# тег пользователя → ключ группы (обратный индекс по triggers)
-_TAG_TO_GROUP: dict[str, str] = {
-    t: g for g, d in FOCUS_GROUPS.items() for t in d["triggers"]
-}
-_ALL_GROUPS: set[str] = set(FOCUS_GROUPS)
+def max_upload_size(interaction: nextcord.Interaction) -> int:
+    """Лимит файла: 10 МБ, на серверах с бустом 2+ уровня — 50/100 МБ."""
+    limit = 10 * MB
+    guild = interaction.guild
+    if guild is not None and (guild.premium_tier or 0) >= 2:
+        limit = guild.filesize_limit
+    if UPLOAD_CAP:
+        limit = min(limit, UPLOAD_CAP)
+    return max(1 * MB, limit - UPLOAD_MARGIN)
 
 
-def focus_groups_for(tags_clean: list[str]) -> set[str]:
-    """Какие телесные группы запросил юзер (по совпадению тега с triggers)."""
-    return {_TAG_TO_GROUP[t] for t in (x.lower() for x in tags_clean)
-            if t in _TAG_TO_GROUP}
-
-
-def requested_nudity_tags(groups: set[str]) -> set[str] | None:
-    """Набор тегов, засчитываемых как «нагота» под конкретный запрос.
-
-    Юзер ищет часть тела → нагота подтверждается ОБЩЕЙ наготой или наготой
-    ИМЕННО запрошенной части. «Голая жопа/писька» сама по себе тег breasts не
-    вытягивает. Без телесного запроса → None (полный NUDITY_TAGS, как раньше).
-    """
-    if not groups:
-        return None
-    nud = set(GENERAL_NUDITY)
-    for g in groups:
-        nud |= FOCUS_GROUPS[g]["nudity"]
-    return nud
-
-
-def _focus_tier(post: dict, groups: set[str]) -> int:
-    """Тир релевантности поста запрошенной части тела (больше = выше в выдаче).
-
-      3 — сюжет = запрошенная часть (и только она);
-      2 — запрошенная часть в фокусе, но в кадре и другая;
-      1 — нейтрально (тег есть, явного фокуса ни на чём нет);
-      0 — сюжет = часть, которую НЕ просили (ровно то, на что жаловались).
-    """
-    if not groups:
-        return 0
-    low = {t.lower() for t in (post.get("tags", "") or "").split()}
-    on = any(low & FOCUS_GROUPS[g]["focus"] for g in groups)
-    off = any(low & FOCUS_GROUPS[g]["focus"] for g in (_ALL_GROUPS - groups))
-    if on:
-        return 3 if not off else 2
-    return 1 if not off else 0
-
-
-def focus_rerank(posts: list[dict], groups: set[str]) -> list[dict]:
-    """Мягкий приоритет по фокусу с фолбэком: стабильная пересортировка по
-    фокус-тиру. off-focus НЕ выкидываем — лишь опускаем вниз (по нишевым тегам
-    выдача не опустеет). Внутри тира порядок сохраняется, значит приоритет
-    качества из weighted_score_shuffle не теряется.
-    """
-    if not groups:
-        return posts
-    return sorted(posts, key=lambda p: _focus_tier(p, groups), reverse=True)
-
-
-def post_is_clean(post: dict, allowed: set[str] | None = None,
-                  require_nudity: bool = True,
-                  nudity_tags: set[str] | None = None) -> bool:
-    """True если пост допустим к показу.
-
-    Правила (по приоритету):
-      1. HARD-блок (яой/фембои/бондаж/БДСМ/фута) — НЕотключаем, даже явным тегом.
-      2. Возрастные и AI теги — НЕотключаемы (подстроки).
-      3. Общий блэклист — можно обойти, если юзер сам запросил такой тег (allowed).
-      4. Явно одетые (fully_clothed и т.п.) — отбрасываем.
-      5. Требование наготы: должен быть хотя бы один nudity-тег.
-    """
-    allowed = allowed or set()
-    raw = post.get("tags", "") or ""
-    post_tags = set(raw.split())
-    low_tags = {t.lower() for t in post_tags}
-
-    # 1. HARD-блок — точные теги
-    if not low_tags.isdisjoint(HARD_SET):
-        return False
-    # 1b. HARD — по токенам (точное совпадение токена, а не подстрока),
-    # чтобы не блочить легитимные теги вроде futaba_sakura (содержит futa).
-    for tag in low_tags:
-        tokens = set(tag.replace("-", "_").split("_"))
-        blocked_hard = False
-        for h in HARD_SUBSTRINGS:
-            hl = h.lower().replace("-", "_").strip("_")
-            if not hl:
-                continue
-            if "_" in hl:
-                # Фраза из нескольких токенов (otoko_no_ko, ball_gag) — ловим подстрокой
-                if hl in tag:
-                    blocked_hard = True
-                    break
-            else:
-                # Одиночный токен — только точное совпадение токена
-                if hl in tokens:
-                    blocked_hard = True
-                    break
-        if blocked_hard:
-            return False
-        if any(crit in tag for crit in CRITICAL_SET):
-            return False
-        if any(ai in tag for ai in AI_SUBSTRINGS):
-            return False
-
-    # 3. Общий блэклист — АБСОЛЮТНЫЙ. Никаких исключений «юзер сам запросил».
-    if not low_tags.isdisjoint(BLACKLIST_SET):
-        return False
-
-    # 4. Явно одетые — вон
-    if not low_tags.isdisjoint(DRESSED_TAGS):
-        return False
-
-    # 5. Требование наготы (полная или частичная). В «умном» ослаблении выключается:
-    #    тогда проходит любой NSFW-результат (safe/general уже отсечены на сервере).
-    #    nudity_tags задаёт набор под конкретный запрос (см. requested_nudity_tags):
-    #    при поиске части тела «голая жопа» не засчитывает наготу для breasts.
-    nud = nudity_tags if nudity_tags is not None else NUDITY_TAGS
-    if require_nudity and low_tags.isdisjoint(nud):
-        return False
-
-    return True
-
-
-# ── Блокированные пользовательские теги (точное совпадение токена) ────────────
-BLOCKED_USER_TAGS = frozenset([
-    "futa", "futanari", "femboy", "trap", "crossdressing", "yaoi", "bara",
-    "gay", "bdsm", "bondage", "shibari", "otoko_no_ko", "cuntboy", "ryona",
-    "astolfo", "felix",
-])
-
-# ── «Приколдес»: теги, при запросе которых выдаём грозное предупреждение ───────
-LGBT_JOKE_TAGS = frozenset([
-    "felix", "astolfo",
-])
+# ── «Приколдес» ───────────────────────────────────────────────────────────────
 LGBT_JOKE_WARNING = (
     "⚠️ **ВНИМАНИЕ!** Запрос подобных материалов карается статьёй 6.21 УК ЧР "
     "«Хранение и распространение материалов содержащих ЛГБТ+ контент». "
     "В ближайшее время на вас будет заведено уголовное дело. "
     "Ваш IP адрес был передан МВД Чернарусской республики."
 )
-
-
-def tag_triggers_lgbt_joke(clean_tag: str) -> bool:
-    """True если тег пользователя совпадает с «приколдес»-тегами (felix/astolfo)."""
-    low = clean_tag.lower()
-    tokens = set(low.split("_"))
-    return low in LGBT_JOKE_TAGS or not tokens.isdisjoint(LGBT_JOKE_TAGS)
-
-
-# ── «Судебное постановление» по запросу Venti ─────────────────────────────────
-VENTI_TAGS = frozenset(["venti"])
 VENTI_WARNING = (
     "**СУДЕБНОЕ ПОСТАНОВЛЕНИЕ РЕСПУБЛИКИ ЧЕРНАРУСЬ**\n\n"
     "Настоящим уведомляем, что в отношении Вас вынесено Судебное постановление "
@@ -450,322 +172,567 @@ VENTI_WARNING = (
     "собой применение суровых мер наказания, **вплоть до расстрела**.\n\n"
     "_Оставайтесь на месте по месту фактического нахождения. Сотрудники уже выехали._"
 )
+# Для Kanzaki Hideri вместо поиска шлём заготовленную картинку.
+KANZAKI_HIDERI_IMAGE = os.path.join(BASE_DIR, "assets", "kanzaki_hideri.jpg")
+BLOCKED_TEXT = "🚫 Один из тегов заблокирован."
 
 
-def tag_triggers_venti(clean_tag: str) -> bool:
-    """True если тег пользователя — Venti."""
-    low = clean_tag.lower()
-    tokens = set(low.split("_"))
-    return low in VENTI_TAGS or not tokens.isdisjoint(VENTI_TAGS)
+def tag_verdict(tags: list[str]) -> str | None:
+    """Особая реакция на теги: 'kanzaki' | 'venti' | 'lgbt' | 'blocked' | None.
 
-
-# ── Спец-картинка для Kanzaki Hideri ──────────────────────────────────────────
-# Если юзер запросил этого персонажа — вместо поиска шлём заранее заготовленную
-# локальную картинку (проверка идёт ДО блокировок).
-KANZAKI_HIDERI_IMAGE = r"C:\Users\MAJOR\Downloads\Секретные файлы ЧДКЗ\3244c5e5-a79b-4718-9b89-4c8cfc008db8.jpg"
-KANZAKI_HIDERI_TAGS = frozenset(["kanzaki_hideri", "kanzaki", "hideri"])
-
-
-def tag_is_kanzaki_hideri(clean_tag: str) -> bool:
-    """True если тег указывает на персонажа Kanzaki Hideri."""
-    low = clean_tag.lower()
-    if low in KANZAKI_HIDERI_TAGS:
-        return True
-    # «kanzaki hideri» / «kanzaki_hideri_(...)» и т.п. — ловим по обоим словам
-    return "kanzaki" in low and "hideri" in low
-
-
-def tag_is_blocked(clean_tag: str) -> bool:
-    """True если тег пользователя запрещён — такой контент не показываем вообще."""
-    low = clean_tag.lower()
-    tokens = set(low.replace("-", "_").split("_"))
-    # Явные пользовательские блок-теги (точное совпадение токена)
-    if low in BLOCKED_USER_TAGS or not tokens.isdisjoint(BLOCKED_USER_TAGS):
-        return True
-    # Общий блэклист (furry, fat, zoophilia, pregnant, peeing и т.д.)
-    # — точное совпадение (без токен-сплита, чтобы не ловить cat_ears/animal_ears).
-    if low in BLACKLIST_SET:
-        return True
-    # Возрастные / AI — по подстрокам, ловим любые вариации
-    if any(c in low for c in CRITICAL_SET):
-        return True
-    if any(a in low for a in AI_SUBSTRINGS):
-        return True
-    # HARD — токен-точное совпадение (не подстрока), чтобы не блочить
-    # легитимные теги вроде futaba_sakura (содержит futa как подстроку).
-    for h in HARD_SUBSTRINGS:
-        hl = h.lower().replace("-", "_").strip("_")
-        if not hl:
-            continue
-        if "_" in hl:
-            if hl in low:
-                return True
-        else:
-            if hl in tokens:
-                return True
-    return False
-
-
-# ── Популярные теги ───────────────────────────────────────────────────────────
-POPULAR_TAGS = [
-    "1girl", "1boy", "2girls", "solo", "couple", "multiple_girls", "group",
-    "breasts", "ass", "nude", "censored", "uncensored", "bikini", "school_uniform",
-    "cat_ears", "kemonomimi", "maid", "twintails", "blonde", "blue_hair",
-    "brown_hair", "pink_hair", "purple_hair", "red_hair", "white_hair", "silver_hair",
-    "long_hair", "short_hair", "curly_hair", "twisted_torso", "highres",
-    "abs", "flexible", "looking_at_viewer", "smile", "blush",
-    "outdoor", "indoor", "bed", "forest", "city", "beach", "swimsuit",
-    "lingerie", "underwear", "thighhighs", "stockings", "socks", "gloves",
-    "hat", "hairband", "ribbons", "bow", "glasses", "eyes", "hetero",
-    "comic", "game_cg", "western",
-]
-
-# Вшитые данные Gelbooru (API Access Credentials).
-# Можно переопределить через переменные окружения GELBOORU_API_KEY / GELBOORU_USER_ID.
-DEFAULT_API_KEY = "6b1df28500ac0cd4d984c238ef37f48e9f154f8ef5c353f739a9462b5c1018cce06df5903b39d1a3595bd6ca53e43d79ecbd6d4b38407bea3625bb5ec45f1827"
-DEFAULT_USER_ID = "1748928"
-
-API_KEY = os.environ.get("GELBOORU_API_KEY") or DEFAULT_API_KEY
-USER_ID = os.environ.get("GELBOORU_USER_ID") or DEFAULT_USER_ID
-
-# ── Telegram userbot (источник /tg) ────────────────────────────────────────────
-def env_any(*names: str) -> str | None:
-    """Первое непустое значение среди нескольких имён env (с обрезкой пробелов).
-
-    Хостинги/люди называют переменные по-разному (TG_API_ID, API_ID, TG_ID…) —
-    ловим самые частые варианты, чтобы /tg не отваливалась из-за имени.
+    Kanzaki проверяется раньше блокировок; остальное — по порядку тегов.
     """
-    for n in names:
-        v = os.environ.get(n)
-        if v and v.strip():
-            return v.strip()
+    if any(cf.tag_is_kanzaki_hideri(t) for t in tags):
+        return "kanzaki"
+    for t in tags:
+        if cf.tag_triggers_venti(t):
+            return "venti"
+        if cf.tag_triggers_lgbt_joke(t):
+            return "lgbt"
+        if cf.tag_is_blocked(t):
+            return "blocked"
     return None
 
 
-TG_API_ID = env_any("TG_API_ID", "API_ID", "TELEGRAM_API_ID", "TG_ID")
-TG_API_HASH = env_any("TG_API_HASH", "API_HASH", "TELEGRAM_API_HASH", "TG_HASH")
-tg_client = None  # Telethon-клиент; поднимается в on_ready, None если ключи не заданы
-TG_CD = CooldownManager(rate=3, per=30.0)
-# Пороги реакций для отсева слабых постов (реакций меньше, чем score Gelbooru).
-TG_REACTION_FLOORS = [20, 5, 0]
+async def answer_verdict(interaction: nextcord.Interaction, verdict: str):
+    if verdict == "kanzaki" and os.path.isfile(KANZAKI_HIDERI_IMAGE):
+        return await interaction.response.send_message(file=nextcord.File(KANZAKI_HIDERI_IMAGE))
+    if verdict == "venti":
+        return await interaction.response.send_message(VENTI_WARNING)
+    if verdict == "lgbt":
+        return await interaction.response.send_message(LGBT_JOKE_WARNING)
+    return await interaction.response.send_message(BLOCKED_TEXT, ephemeral=True)
 
-# Прокси для всех запросов к Gelbooru (если сайт заблокирован у провайдера).
-# Поддерживается http/https-прокси, напр. "http://user:pass@host:port".
-# Берётся из GELBOORU_PROXY, иначе из стандартных HTTPS_PROXY/HTTP_PROXY.
-PROXY = (
-    os.environ.get("GELBOORU_PROXY")
-    or os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
-    or os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy")
-    or None
-)
 
-BASE_URL = "https://gelbooru.com/index.php"
+# ── Утилиты отправки ──────────────────────────────────────────────────────────
+async def safe_followup(interaction: nextcord.Interaction, content=None, **kwargs):
+    try:
+        return await interaction.followup.send(content=content, **kwargs)
+    except NotFound:
+        logger.warning("[safe_followup] интеракция протухла")
+    except Exception as e:
+        logger.error(f"[safe_followup] {type(e).__name__}: {e}")
+    return None
 
-headers = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-    "Accept": "application/json, text/xml, */*",
-    "Referer": "https://gelbooru.com/",
+
+def _send_kwargs(payload: dict) -> dict:
+    """payload → аргументы followup.send без пустых полей."""
+    out = {}
+    if payload.get("content"):
+        out["content"] = payload["content"]
+    if payload.get("embed") is not None:
+        out["embed"] = payload["embed"]
+    if payload.get("file") is not None:
+        out["file"] = payload["file"]
+    if payload.get("files"):
+        out["files"] = payload["files"]
+    return out
+
+
+MAX_DOWNLOAD_TRIES = 8                # сколько постов пробуем скачать за запрос
+_inflight: set[tuple[str, str]] = set()  # (запрос, арт), которые прямо сейчас отправляются
+
+
+async def send_first_fitting(interaction, rkey: str, candidates: list[dict], make_payload):
+    """Отправляет первого кандидата, который скачался и влез в лимит Discord.
+
+    → (отправленный пост | None, множество причин неудач).
+    Посты, которые в эту секунду отправляет параллельный запрос с тем же
+    тегом, пропускаются — иначе двое одновременно получат один и тот же арт.
+    """
+    reasons: set[str] = set()
+    tries = 0
+    for post in candidates:
+        key = (rkey, post_uid(post))
+        if key in _inflight:
+            continue
+        if tries >= MAX_DOWNLOAD_TRIES:
+            break
+        tries += 1
+        _inflight.add(key)
+        try:
+            payload, reason = await make_payload(post)
+            if payload is None:
+                reasons.add(reason or "error")
+                continue
+            try:
+                await interaction.followup.send(**_send_kwargs(payload))
+            except nextcord.HTTPException as e:
+                if e.status == 413:
+                    logger.warning("413 от Discord — пробую следующего кандидата")
+                    reasons.add("too_big")
+                    continue
+                raise
+            memory.remember(rkey, key[1])
+            return post, reasons
+        finally:
+            _inflight.discard(key)
+    return None, reasons
+
+
+def nothing_sent_text(display_tag: str, label: str, reasons: set[str]) -> str:
+    if reasons and reasons <= {"too_big"}:
+        return f"❌ По тегу `{display_tag}` все подходящие файлы слишком большие для загрузки."
+    return f"❌ Не удалось скачать арты с {label}. Попробуй ещё раз."
+
+
+def source_error_text(label: str, errors: list[str]) -> str:
+    if "auth" in errors:
+        return f"❌ {label} отказал в доступе (нужен API-ключ или сайт заблокирован)."
+    if "rate" in errors:
+        return f"⏳ {label} ограничил частоту запросов — попробуй через минуту."
+    return f"❌ {label} сейчас не отвечает. Попробуй позже."
+
+
+# ── Embed ─────────────────────────────────────────────────────────────────────
+RATING_LABELS = {
+    "general": "🟢 General",
+    "safe": "🟢 Safe",
+    "sensitive": "🟡 Sensitive",
+    "questionable": "🟠 Questionable",
+    "explicit": "🔴 Explicit",
 }
 
 
-def base_params(**extra) -> dict:
-    """Общие параметры запроса + ключи API (если заданы)."""
-    params = {"page": "dapi", "q": "index", "json": "1"}
-    params.update(extra)
-    if API_KEY:
-        params["api_key"] = API_KEY
-    if USER_ID:
-        params["user_id"] = USER_ID
-    return params
+def rating_label(post: dict) -> str:
+    return RATING_LABELS.get((post.get("rating") or "").lower(), "—")
 
 
-# ── Утилиты ──────────────────────────────────────────────────────────────────
-
-async def safe_followup(interaction: nextcord.Interaction, content=None, embed=None, **kwargs):
-    try:
-        return await interaction.followup.send(content=content, embed=embed, **kwargs)
-    except NotFound:
-        logger.warning("[safe_followup] Interaction expired")
-    except Exception as e:
-        logger.error(f"[safe_followup] error: {e}")
-    return None
-
-
-async def fetch_json(
-    http_session: aiohttp.ClientSession,
-    params: dict,
-    timeout: aiohttp.ClientTimeout = None,
-    retries: int = 3,
-    backoff: float = 1.5,
-    base_url: str = None,
-) -> str | None:
-    """GET-запрос с авторетраями на таймаут/ошибку соединения."""
-    t = timeout or API_TIMEOUT
-    url = base_url or BASE_URL
-    for attempt in range(1, retries + 1):
-        try:
-            async with http_session.get(url, params=params, headers=headers, timeout=t, proxy=PROXY) as resp:
-                if resp.status == 200:
-                    return await resp.text()
-                logger.warning(f"[fetch_json] status={resp.status} attempt={attempt}")
-                return None  # не таймаут — повторять бессмысленно
-        except (aiohttp.ServerTimeoutError, asyncio.TimeoutError) as e:
-            logger.warning(f"[fetch_json] timeout attempt={attempt}/{retries}: {e}")
-            if attempt < retries:
-                await asyncio.sleep(backoff * attempt)
-        except aiohttp.ClientConnectionError as e:
-            logger.warning(f"[fetch_json] connection error attempt={attempt}/{retries}: {e}")
-            if attempt < retries:
-                await asyncio.sleep(backoff * attempt)
-        except Exception as e:
-            logger.error(f"[fetch_json] unexpected error: {e}")
-            return None
-    return None
+def format_tags_preview(tags_str: str, limit: int = 14, maxlen: int = 950) -> str:
+    """Теги поста → `tag` `tag` … +N (с обрезкой по длине поля embed)."""
+    tags = (tags_str or "").split()
+    if not tags:
+        return ""
+    text = " ".join(f"`{t}`" for t in tags[:limit])
+    if len(tags) > limit:
+        text += f" … +{len(tags) - limit}"
+    return text[:maxlen]
 
 
-def parse_posts(text: str) -> list[dict] | None:
-    """Разобрать JSON или XML ответ Gelbooru → список постов."""
-    try:
-        data = json.loads(text)
-        if isinstance(data, dict):
-            post = data.get("post", [])
-            if isinstance(post, dict):  # один пост может прийти словарём
-                return [post]
-            return post or []
-        return data or []
-    except json.JSONDecodeError:
-        pass
-    try:
-        root = ET.fromstring(text)
-        return [p.attrib for p in root.findall(".//post")]
-    except Exception:
-        pass
-    import re
-    urls = re.findall(r'file_url="([^"]+)"', text)
-    return [{"file_url": u} for u in urls] if urls else None
+def build_post_embed(source, post: dict, display_tag: str, size: int, filename: str,
+                     reduced: bool) -> nextcord.Embed:
+    """Embed: рейтинг, score, размер, разрешение, аффтор, теги, ссылки."""
+    embed = nextcord.Embed(title="🖼 Результат по тегу", description=f"`{display_tag}`",
+                           color=0x00ff00)
+    score = post.get("score")
+    embed.add_field(name="📊 Score", value=str(score) if score is not None else "N/A", inline=True)
+    embed.add_field(name="🔞 Рейтинг", value=rating_label(post), inline=True)
+    embed.add_field(name="📏 Размер", value=f"{size / MB:.1f} MB", inline=True)
+    width, height = post.get("width"), post.get("height")
+    if width and height:
+        embed.add_field(name="📐 Разрешение", value=f"{width}×{height}", inline=True)
+    embed.add_field(name="👤 Аффтор", value=str(post.get("owner") or "—")[:100], inline=True)
+    if reduced:
+        embed.add_field(name="🗜 Версия", value="сжатая (оригинал не влез)", inline=True)
+    links = f"[Открыть пост]({source.post_url(post)})"
+    src = (post.get("source") or "").strip()
+    if src.startswith("http") and " " not in src and len(src) < 500:
+        links += f" • [Источник]({src})"
+    embed.add_field(name="🔗 Ссылки", value=links, inline=False)
+    preview = format_tags_preview(post.get("tags") or "")
+    if preview:
+        embed.add_field(name="🏷️ Теги", value=preview, inline=False)
+    embed.set_image(url=f"attachment://{filename}")
+    embed.set_footer(text=f"{source.name} • ID {post.get('id', '')}")
+    return embed
 
 
-# Discord нередко принимает меньше, чем сообщает guild.filesize_limit, а в
-# multipart к файлу добавляется ещё JSON эмбеда — берём безопасный потолок и запас.
-UPLOAD_HARD_CAP = int(os.environ.get("MAX_UPLOAD_MB", "10")) * 1024 * 1024
-UPLOAD_MARGIN = 512 * 1024  # запас на embed + overhead мультипарта
-# Сколько «строгих» (раздетых) постов считаем достаточным, чтобы НЕ ослаблять фильтр.
-MIN_POOL = 12
+async def build_booru_payload(source, post: dict, display_tag: str, max_size: int):
+    """Скачивает медиа поста → (payload для отправки | None, причина неудачи)."""
+    media, reason = await booru.fetch_media(source, post, max_size)
+    if media is None:
+        return None, reason
+    size = len(media.data)
+    filename = f"{source.name.lower()}_{post.get('id') or 'art'}.{media.ext}"
+    file = nextcord.File(BytesIO(media.data), filename=filename)
+    if media.is_video:
+        content = (f"🎬 **Видео** `{display_tag}` • 📊 {post.get('score', 'N/A')} • "
+                   f"🔞 {rating_label(post)} • {size / MB:.1f} MB • "
+                   f"[Открыть пост](<{source.post_url(post)}>)")
+        return {"content": content, "file": file}, ""
+    embed = build_post_embed(source, post, display_tag, size, filename, media.reduced)
+    return {"embed": embed, "file": file}, ""
 
 
-def max_upload_size(interaction: nextcord.Interaction) -> int:
-    """Безопасный лимит загрузки: min(лимит сервера, потолок) минус запас."""
-    guild = interaction.guild
-    base = guild.filesize_limit if guild is not None else 10 * 1024 * 1024
-    base = min(base, UPLOAD_HARD_CAP)
-    return max(1 * 1024 * 1024, base - UPLOAD_MARGIN)
+# ── Поиск по booru ────────────────────────────────────────────────────────────
+async def run_booru_search(interaction: nextcord.Interaction, raw_tags: tuple, source,
+                           cooldown: CooldownManager, *, nsfw: bool = True):
+    """Общая логика /gelbooru, /konachan, /safebooru.
 
-
-async def download_media(
-    http_session: aiohttp.ClientSession, url: str, max_size: int
-) -> tuple[bytes | None, int | None, str | None]:
-    """Скачать файл с проверкой размера через HEAD.
-
-    Возвращает (data, size, reason). data=None если не скачан;
-    reason='too_big' если файл превышает лимит, иначе 'error'.
+    nsfw=True — только NSFW-каналы/личка и требование наготы (для Safebooru оба
+    выключены; система блокировки тегов та же).
     """
-    # HEAD — чтобы не качать огромный файл зря
-    file_size = None
+    if nsfw and not channel_allows_nsfw(interaction):
+        return await interaction.response.send_message(NSFW_ONLY, ephemeral=True)
+    tags = cf.clean_user_tags(raw_tags)
+    if not tags:
+        return await interaction.response.send_message("❌ Укажи хотя бы один тег.", ephemeral=True)
+
+    # Заблокированный тег — тихий ответ только автору и без траты кулдауна.
+    verdict = tag_verdict(tags)
+    if verdict == "blocked":
+        return await answer_verdict(interaction, verdict)
+    if await reject_if_on_cooldown(interaction, cooldown):
+        return
+    if verdict:
+        return await answer_verdict(interaction, verdict)
+
     try:
-        async with http_session.head(url, headers=headers, timeout=HEAD_TIMEOUT, proxy=PROXY) as head_resp:
-            cl = head_resp.headers.get("Content-Length")
-            if cl:
-                file_size = int(cl)
+        await interaction.response.defer()
+    except (NotFound, nextcord.HTTPException) as e:
+        logger.warning(f"[{source.name}] defer не удался: {e}")
+        return
+
+    display_tag = " + ".join(tags)
+    rkey = recent_key(source.name, tags)
+    try:
+        res = await booru.search(source, tags, memory.recent(rkey), require_nudity=nsfw)
+        if not res.candidates:
+            if res.errors and not res.fetched:
+                text = source_error_text(source.name, res.errors)
+            else:
+                text = f"❌ По тегу `{display_tag}` на {source.name} ничего не найдено."
+            return await interaction.followup.send(text)
+
+        max_size = max_upload_size(interaction)
+        sent, reasons = await send_first_fitting(
+            interaction, rkey, res.candidates,
+            lambda p: build_booru_payload(source, p, display_tag, max_size))
+        if sent is None:
+            await safe_followup(interaction, nothing_sent_text(display_tag, source.name, reasons))
+    except NotFound:
+        logger.warning(f"[{source.name}] интеракция протухла")
     except Exception:
-        pass  # HEAD не поддерживается — продолжим без него
-
-    if file_size is not None and file_size > max_size:
-        return None, file_size, "too_big"
-
-    for attempt in range(1, 4):
-        try:
-            async with http_session.get(url, headers=headers, timeout=IMG_TIMEOUT, proxy=PROXY) as resp:
-                if resp.status != 200:
-                    logger.warning(f"[download_media] status={resp.status}")
-                    return None, file_size, "error"
-                data = await resp.read()
-                if len(data) > max_size:
-                    return None, len(data), "too_big"
-                return data, len(data), None
-        except (aiohttp.ServerTimeoutError, asyncio.TimeoutError,
-                aiohttp.ClientConnectionError):
-            # таймаут или обрыв связи (частое через туннель) — ретраим
-            logger.warning(f"[download_media] timeout/disconnect attempt={attempt}")
-            if attempt < 3:
-                await asyncio.sleep(1.5 * attempt)
-        except Exception as e:
-            logger.error(f"[download_media] error: {e}")
-            return None, file_size, "error"
-    return None, file_size, "error"
+        logger.exception(f"[{source.name}] ошибка поиска по `{display_tag}`")
+        await safe_followup(interaction, "❌ Произошла внутренняя ошибка. Проверь консоль бота.")
 
 
-# ── Events ───────────────────────────────────────────────────────────────────
+TAG_OPTION = "Главный тег для поиска"
+EXTRA_OPTION = "Доп. тег для сужения (необязательно)"
+
+
+@bot.slash_command(name='gelbooru',
+                   description="🔞 Арт по тегам с Gelbooru — приоритет твоему запросу (до 4 тегов)")
+async def gelbooru(
+    interaction: nextcord.Interaction,
+    tag: str = nextcord.SlashOption(description=TAG_OPTION, required=True),
+    tag2: str = nextcord.SlashOption(description=EXTRA_OPTION, required=False, default=None),
+    tag3: str = nextcord.SlashOption(description=EXTRA_OPTION, required=False, default=None),
+    tag4: str = nextcord.SlashOption(description=EXTRA_OPTION, required=False, default=None),
+):
+    await run_booru_search(interaction, (tag, tag2, tag3, tag4), GELBOORU, GELBOORU_CD)
+
+
+@bot.slash_command(name='konachan',
+                   description="🔞 Арт по тегам с Konachan — аниме-арт высокого качества (до 4 тегов)")
+async def konachan(
+    interaction: nextcord.Interaction,
+    tag: str = nextcord.SlashOption(description=TAG_OPTION, required=True),
+    tag2: str = nextcord.SlashOption(description=EXTRA_OPTION, required=False, default=None),
+    tag3: str = nextcord.SlashOption(description=EXTRA_OPTION, required=False, default=None),
+    tag4: str = nextcord.SlashOption(description=EXTRA_OPTION, required=False, default=None),
+):
+    await run_booru_search(interaction, (tag, tag2, tag3, tag4), KONACHAN, KONACHAN_CD)
+
+
+@bot.slash_command(name='safebooru',
+                   description="🟢 Safe-арт по тегам с Safebooru — без NSFW, в любом канале (до 4 тегов)")
+async def safebooru(
+    interaction: nextcord.Interaction,
+    tag: str = nextcord.SlashOption(description=TAG_OPTION, required=True),
+    tag2: str = nextcord.SlashOption(description=EXTRA_OPTION, required=False, default=None),
+    tag3: str = nextcord.SlashOption(description=EXTRA_OPTION, required=False, default=None),
+    tag4: str = nextcord.SlashOption(description=EXTRA_OPTION, required=False, default=None),
+):
+    await run_booru_search(interaction, (tag, tag2, tag3, tag4), SAFEBOORU, SAFEBOORU_CD,
+                           nsfw=False)
+
+
+# ── /tags ─────────────────────────────────────────────────────────────────────
+# Только живые теги Gelbooru (устаревшие blonde/outdoor/kemonomimi заменены, а
+# 1boy/hetero убраны — такие арты всё равно режет HARD-блок).
+POPULAR_TAGS = [
+    "1girl", "solo", "2girls", "multiple_girls",
+    "breasts", "ass", "nude", "censored", "uncensored", "bikini", "school_uniform",
+    "cat_ears", "animal_ears", "maid", "twintails", "blonde_hair", "blue_hair",
+    "brown_hair", "pink_hair", "purple_hair", "red_hair", "white_hair", "grey_hair",
+    "long_hair", "short_hair", "curly_hair", "twisted_torso",
+    "abs", "flexible", "looking_at_viewer", "smile", "blush",
+    "outdoors", "indoors", "bed", "forest", "city", "beach", "swimsuit",
+    "lingerie", "underwear", "thighhighs", "pantyhose", "socks", "gloves",
+    "hat", "hairband", "ribbon", "bow", "glasses", "comic",
+]
+
+
+def short_count(n: int) -> str:
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if n >= 1_000:
+        return f"{n / 1_000:.0f}k"
+    return str(n)
+
+
+@bot.slash_command(name='tags', description="🏷️ Популярные теги и сколько по ним артов")
+async def tags_list(interaction: nextcord.Interaction):
+    if await reject_if_on_cooldown(interaction, TAGS_CD):
+        return
+    await interaction.response.defer(ephemeral=True)
+    try:
+        info = await GELBOORU.tag_info(POPULAR_TAGS)
+    except booru.SourceError as e:
+        return await safe_followup(interaction, source_error_text("Gelbooru", [e.kind]), ephemeral=True)
+
+    alive = sorted(((t, int(info[t].get("count") or 0)) for t in POPULAR_TAGS
+                    if t in info and not cf.tag_is_blocked(t)),
+                   key=lambda x: -x[1])
+    alive = [(t, c) for t, c in alive if c > 0]
+    lines = " • ".join(f"`{t}` {short_count(c)}" for t, c in alive)
+    embed = nextcord.Embed(title="🏷️ Популярные теги",
+                           description=lines[:4000] or "Не удалось получить список тегов.",
+                           color=0x2ecc71)
+    embed.set_footer(text="💡 Число — сколько артов на Gelbooru. Свой тег проверь через /tagcheck")
+    await safe_followup(interaction, embed=embed, ephemeral=True)
+
+
+# ── /tagcheck ─────────────────────────────────────────────────────────────────
+@bot.slash_command(name='tagcheck', description="🔍 Проверить, есть ли на Gelbooru арты по тегу")
+async def tag_check(
+    interaction: nextcord.Interaction,
+    tag: str = nextcord.SlashOption(description="Тег для проверки", required=True),
+):
+    if not channel_allows_nsfw(interaction):
+        return await interaction.response.send_message(NSFW_ONLY, ephemeral=True)
+    cleaned = cf.clean_user_tags([tag])
+    if not cleaned:
+        return await interaction.response.send_message("❌ Укажи тег.", ephemeral=True)
+    clean_tag = cleaned[0].lstrip("-")
+    if cf.tag_is_blocked(clean_tag):
+        return await interaction.response.send_message(
+            f"🚫 Тег `{clean_tag}` заблокирован в боте.", ephemeral=True)
+    if await reject_if_on_cooldown(interaction, TAGCHECK_CD):
+        return
+    await interaction.response.defer()
+
+    try:
+        info = (await GELBOORU.tag_info([clean_tag])).get(clean_tag)
+        count = int(info.get("count") or 0) if info else 0
+        deprecated = bool(info) and str(info.get("type")) == "6"
+        similar = []
+        if count == 0 or deprecated:
+            part = clean_tag.strip("*%_")
+            if part:
+                similar = [t for t in await GELBOORU.similar_tags(part, 8)
+                           if t.get("name") != clean_tag and int(t.get("count") or 0) > 0
+                           and not cf.tag_is_blocked(t["name"])][:5]
+    except booru.SourceError as e:
+        return await safe_followup(interaction, source_error_text("Gelbooru", [e.kind]))
+
+    if count > 0:
+        embed = nextcord.Embed(title=f"✅ Тег `{clean_tag}` активен!",
+                               description=f"Артов на Gelbooru: **{count:,}**".replace(",", " "),
+                               color=0x2ecc71)
+        embed.add_field(name="💡 Используй", value=f"`/gelbooru {clean_tag}`", inline=False)
+        if deprecated:
+            embed.add_field(name="⚠️ Тег устаревший",
+                            value="Новые арты могут быть под другим именем.", inline=False)
+    else:
+        embed = nextcord.Embed(title=f"❌ Тег `{clean_tag}` не найден",
+                               description="На Gelbooru нет артов с таким тегом.",
+                               color=0xe74c3c)
+    if similar:
+        embed.add_field(name="🔎 Похожие теги",
+                        value="\n".join(f"`{t['name']}` — {short_count(int(t.get('count') or 0))}"
+                                        for t in similar),
+                        inline=False)
+    elif count == 0:
+        embed.add_field(name="💡 Попробуй",
+                        value="• Проверь написание (теги на английском, через `_`)\n"
+                              "• Посмотри `/tags`", inline=False)
+    await safe_followup(interaction, embed=embed)
+
+
+# ── /tg — арты из Telegram-каналов ────────────────────────────────────────────
+DISCORD_MAX_FILES = 10  # Discord принимает максимум 10 вложений в сообщении
+
+
+def _is_video_msg(m) -> bool:
+    return tg_source.media_ext(m) in ("mp4", "webm", "mov", "m4v", "gif")
+
+
+async def build_tg_payload(post: dict, max_size: int):
+    """Пост целиком: все картинки и видео в исходном порядке, пока влезают в
+    лимит Discord на ВСЁ сообщение. Не влезшее — ссылкой «Открыть пост».
+    → (payload | None, причина).
+    """
+    msg = post["_msg"]
+    album = None
+    if post.get("_peer") is not None:
+        album = await tg_source.fetch_album_messages(tg_client, post["_peer"], msg)
+    media_msgs = [m for m in (album or post.get("_msgs") or [msg]) if tg_source.has_visual_media(m)]
+    if not media_msgs:
+        return None, "no_file"
+
+    has_video = any(_is_video_msg(m) for m in media_msgs)
+    files, total, skipped = [], 0, 0
+    for m in media_msgs:
+        remaining = max_size - total
+        f = getattr(m, "file", None)
+        approx = getattr(f, "size", None) if f else None
+        if len(files) >= DISCORD_MAX_FILES or (approx and approx > remaining):
+            skipped += 1
+            continue
+        data, size, _ = await tg_source.download_media(tg_client, m, remaining)
+        if not data:
+            skipped += 1
+            continue
+        filename = f"tg_{post['_alias']}_{m.id}.{tg_source.media_ext(m)}"
+        files.append(nextcord.File(BytesIO(data), filename=filename))
+        total += size
+
+    link = tg_source.post_link(post)
+    head = f"{'🎬' if has_video else '🖼'} **{post['_alias']}** • ❤️ {post.get('score', 0)}"
+    if not files:
+        if not link:
+            return None, "too_big"
+        # Медиа было, но не влезло (тяжёлое видео/альбом) — отдаём ссылку.
+        parts = [head, "⬆️ файлы слишком большие — смотри в источнике", f"[Открыть пост]({link})"]
+        return {"content": " • ".join(parts)}, ""
+    parts = [head]
+    if len(files) > 1:
+        parts.append(f"📎 {len(files)} файлов")
+    if skipped:
+        parts.append(f"➕ ещё {skipped} в посте")
+    if link:
+        parts.append(f"[Открыть пост](<{link}>)")
+    return {"content": " • ".join(parts), "files": files}, ""
+
+
+async def run_tg_search(interaction: nextcord.Interaction, alias: str | None):
+    """Топовый по реакциям ещё не показанный пост из выбранного/случайного канала."""
+    label = "Telegram"
+    if not channel_allows_nsfw(interaction):
+        return await interaction.response.send_message(NSFW_ONLY, ephemeral=True)
+    if tg_client is None:
+        return await interaction.response.send_message(
+            "⚠️ Telegram-источник не настроен (нет TG_API_ID/TG_API_HASH или сессии).",
+            ephemeral=True)
+    channels = tg_source.load_channels()
+    if not channels:
+        return await interaction.response.send_message(
+            "⚠️ Список каналов пуст — заполни `tg_channels.json`.", ephemeral=True)
+    if alias:
+        chosen = next((c for c in channels if c["alias"].lower() == alias.lower()), None)
+        if chosen is None:
+            avail = ", ".join(f"`{c['alias']}`" for c in channels)
+            return await interaction.response.send_message(
+                f"❌ Канал `{alias}` не найден. Доступны: {avail}", ephemeral=True)
+    else:
+        chosen = random.choice(channels)
+    if await reject_if_on_cooldown(interaction, TG_CD):
+        return
+    try:
+        await interaction.response.defer()
+    except (NotFound, nextcord.HTTPException) as e:
+        logger.warning(f"[{label}] defer не удался: {e}")
+        return
+
+    rkey = recent_key(label, [chosen["alias"]])
+    try:
+        raw = await tg_source.fetch_channel_arts(tg_client, chosen["alias"], chosen["peer"])
+        if not raw:
+            return await interaction.followup.send(
+                f"❌ В канале `{chosen['alias']}` не нашлось подходящих артов.")
+        candidates = order_candidates(raw, memory.recent(rkey))[:booru.CANDIDATE_LIMIT]
+        max_size = max_upload_size(interaction)
+        sent, reasons = await send_first_fitting(
+            interaction, rkey, candidates, lambda p: build_tg_payload(p, max_size))
+        if sent is None:
+            await safe_followup(interaction, nothing_sent_text(chosen["alias"], label, reasons))
+    except NotFound:
+        logger.warning(f"[{label}] интеракция протухла")
+    except Exception:
+        logger.exception(f"[{label}] ошибка в канале {chosen['alias']}")
+        await safe_followup(interaction, "❌ Произошла внутренняя ошибка. Проверь консоль бота.")
+
+
+@bot.slash_command(name="tg", description="🔞 Арт из телеграм канала")
+async def tg_command(
+    interaction: nextcord.Interaction,
+    channel: str = nextcord.SlashOption(name="channel", description="Канал из списка (пусто — случайный)",
+                                        required=False, default=None, autocomplete=True),
+):
+    await run_tg_search(interaction, channel)
+
+
+@tg_command.on_autocomplete("channel")
+async def tg_command_autocomplete(interaction: nextcord.Interaction, value: str):
+    aliases = [c["alias"] for c in tg_source.load_channels()]
+    if value:
+        aliases = [a for a in aliases if value.lower() in a.lower()]
+    await interaction.response.send_autocomplete(aliases[:25])
+
+
+# ── /help ─────────────────────────────────────────────────────────────────────
+@bot.slash_command(name='help', description="📖 Справка: список команд и как ими пользоваться")
+async def help_command(interaction: nextcord.Interaction):
+    embed = nextcord.Embed(title=f"📖 Справка по боту Gelbooru v{VERSION}",
+                           description="Список всех доступных команд:", color=0x3498db)
+    embed.add_field(name="🔞 /gelbooru <тег> [тег2] [тег3] [тег4]", value="Арт/гиф/видео по 1-4 тегам с **Gelbooru** — приоритет твоему запросу", inline=False)
+    embed.add_field(name="🔞 /konachan <тег> [тег2] [тег3] [тег4]", value="Арт по 1-4 тегам с **Konachan** (аниме-арт)", inline=False)
+    embed.add_field(name="🟢 /safebooru <тег> [тег2] [тег3] [тег4]", value="Safe-арт по 1-4 тегам с **Safebooru** — без NSFW, работает в любом канале", inline=False)
+    embed.add_field(name="🔞 /tg [канал]", value="Арт из **Telegram**-канала — весь пост (все картинки и видео)", inline=False)
+    embed.add_field(name="🏷️ /tags", value="Популярные теги и сколько по ним артов", inline=False)
+    embed.add_field(name="🔍 /tagcheck <тег>", value="Проверить тег и подсказать похожие, если опечатка", inline=False)
+    embed.add_field(name="📖 /help", value="Показать эту справку", inline=False)
+    embed.set_footer(text="💡 NSFW-команды работают только в NSFW-каналах или в ЛС. Тег с минусом (-tag) исключает его.")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+# ── События ───────────────────────────────────────────────────────────────────
+_started = False
+
 
 @bot.event
 async def on_ready():
-    await get_session()  # создаём общую сессию (внутри event loop)
-    load_recent_shown()  # восстанавливаем память показанных артов после рестарта
-    logger.info(f"✅ Бот онлайн: {bot.user.name}")
-    logger.info(f"📋 Версия: {VERSION}")
-    if not API_KEY or not USER_ID:
-        logger.warning("⚠️ GELBOORU_API_KEY / GELBOORU_USER_ID не заданы — "
-                       "возможны ограничения API Gelbooru.")
-    if PROXY:
-        logger.info(f"🌐 Запросы к Gelbooru идут через прокси: {PROXY}")
+    """Срабатывает и после каждого переподключения — разовая настройка под флагом."""
+    global _started, tg_client
+    logger.info(f"✅ Бот онлайн: {bot.user} • v{VERSION} • серверов: {len(bot.guilds)}")
+    if _started:
+        return
+    _started = True
 
-    # Telegram userbot — поднимаем один раз, переиспользуем общий event loop.
-    global tg_client
-    # Диагностика: какие из трёх TG-переменных реально видит процесс (без значений).
-    logger.info(
-        "[tg] env-проверка: TG_API_ID=%s | TG_API_HASH=%s | TG_SESSION_STRING=%s",
-        "есть" if TG_API_ID else "НЕТ",
-        "есть" if TG_API_HASH else "НЕТ",
-        "есть" if tg_source.SESSION_STRING else "НЕТ (будет искать файл сессии)",
-    )
-    if tg_client is None and TG_API_ID and TG_API_HASH:
+    if not (GELBOORU.api_key and GELBOORU.user_id):
+        logger.warning("⚠️ GELBOORU_API_KEY / GELBOORU_USER_ID не заданы — Gelbooru "
+                       "без ключа отвечает 401, /gelbooru работать не будет.")
+    if booru.PROXY:
+        logger.info(f"🌐 Запросы к сайтам идут через прокси: {booru.masked_proxy()}")
+
+    # Telegram userbot — поднимаем один раз в общем event loop.
+    logger.info("[tg] env: TG_API_ID=%s | TG_API_HASH=%s | TG_SESSION_STRING=%s",
+                "есть" if TG_API_ID else "НЕТ", "есть" if TG_API_HASH else "НЕТ",
+                "есть" if tg_source.SESSION_STRING else "НЕТ (будет искать файл сессии)")
+    if TG_API_ID and TG_API_HASH:
         try:
             tg_client = await tg_source.start_client(int(TG_API_ID), TG_API_HASH)
-            chans = tg_source.load_channels()
-            logger.info(f"✅ Telegram userbot подключён, каналов в списке: {len(chans)}")
+            logger.info(f"✅ Telegram userbot подключён, каналов: {len(tg_source.load_channels())}")
         except Exception as e:
-            logger.error(f"⚠️ Telegram userbot не запущен: {type(e).__name__}: {e} — /tg будет недоступна.")
-    elif not (TG_API_ID and TG_API_HASH):
-        logger.warning("ℹ️ TG_API_ID / TG_API_HASH не заданы (процесс их не видит) — команда /tg отключена.")
-
-    # Регистрация слэш-команд БЕЗ дублей. Дубль в списке Discord возникает, когда
-    # одна команда живёт сразу в ДВУХ скоупах — глобальном и guild: Discord тогда
-    # показывает её дважды. Поэтому перед синком ПОЛНОСТЬЮ сносим «лишний» скоуп
-    # прямым bulk-овеписом пустым списком — это надёжнее, чем sync с delete_unknown
-    # (тот молча не срабатывал, дубли оставались).
-    app_id = bot.application_id
-    if GUILD_IDS:
-        # Guild-режим: команды на серверах появляются мгновенно. Сносим ВСЕ
-        # глобальные команды (иначе они двоятся с guild-копиями), затем
-        # регистрируем guild-команды.
-        try:
-            await bot.http.bulk_upsert_global_commands(app_id, [])
-        except Exception as e:
-            logger.warning(f"Не удалось снести глобальные команды: {e}")
-        await bot.sync_all_application_commands()
-        logger.info(f"⚡ Слэш-команды синхронизированы для серверов: {GUILD_IDS} "
-                    f"(глобальные снесены — дублей не будет).")
+            logger.error(f"⚠️ Telegram userbot не запущен: {type(e).__name__}: {e} — /tg недоступна.")
     else:
-        # Глобальный режим: сносим залежавшиеся GUILD-команды на всех серверах с
-        # ботом (остались бы от прежнего guild-режима и двоились бы с глобальными),
-        # затем регистрируем глобально.
+        logger.warning("ℹ️ TG_API_ID / TG_API_HASH не заданы — команда /tg отключена.")
+
+    # Слэш-команды nextcord синхронизирует сам при подключении (глобальные — в
+    # on_connect, серверные — в on_guild_available; лишние глобальные при
+    # guild-режиме он же и удаляет). В глобальном режиме остаётся снести
+    # серверные копии от прежнего guild-режима — иначе команды двоятся.
+    if not GUILD_IDS:
         for g in list(bot.guilds):
             try:
-                await bot.http.bulk_upsert_guild_commands(app_id, g.id, [])
+                await bot.http.bulk_upsert_guild_commands(bot.application_id, g.id, [])
             except Exception as e:
-                logger.warning(f"Не удалось снести guild-команды на сервере {g.id}: {e}")
-        await bot.sync_application_commands()
-        logger.info("🌐 Слэш-команды зарегистрированы глобально (обновление до ~1 часа; "
-                    "guild-дубли снесены).")
+                logger.warning(f"Не удалось снести серверные команды на {g.id}: {e}")
+        logger.info("🌐 Слэш-команды глобальные (обновление до ~1 часа).")
+    else:
+        logger.info(f"⚡ Слэш-команды для серверов: {GUILD_IDS}")
 
 
 @bot.event
@@ -780,1038 +747,52 @@ async def on_application_command_error(interaction: nextcord.Interaction, error:
         pass
 
 
-# ── /help ─────────────────────────────────────────────────────────────────────
-
-@bot.slash_command(name='help', description="📖 Справка: список команд и как ими пользоваться")
-async def help_command(interaction: nextcord.Interaction):
-    embed = nextcord.Embed(
-        title=f"📖 Справка по боту Gelbooru v{VERSION}",
-        description="Список всех доступных команд:",
-        color=0x3498db
-    )
-    embed.add_field(name="🔞 /gelbooru <тег> [тег2] [тег3] [тег4]", value="Арт/гиф/видео по 1-4 тегам с **Gelbooru** — приоритет твоему запросу", inline=False)
-    embed.add_field(name="🔞 /konachan <тег> [тег2] [тег3] [тег4]", value="Арт/гиф/видео по 1-4 тегам с **Konachan** (аниме-арт)", inline=False)
-    embed.add_field(name="🟢 /safebooru <тег> [тег2] [тег3] [тег4]", value="Safe-арт по 1-4 тегам с **Safebooru** — без NSFW, работает в любом канале", inline=False)
-    embed.add_field(name="🔞 /tg [канал]", value="Арт из **Telegram**-канала — весь пост (все картинки и видео)", inline=False)
-    embed.add_field(name="🏷️ /tags", value="Показать популярные теги и их статус", inline=False)
-    embed.add_field(name="🔍 /tagcheck <тег>", value="Проверить, есть ли арты по тегу", inline=False)
-    embed.add_field(name="📖 /help", value="Показать эту справку", inline=False)
-    embed.set_footer(text="💡 NSFW-команды работают только в NSFW-каналах или в ЛС. /tags — список тегов.")
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
-
-# ── /tags ─────────────────────────────────────────────────────────────────────
-
-async def _check_tag(http_session: aiohttp.ClientSession, tag: str) -> bool:
-    """Проверить есть ли хотя бы 1 пост по тегу. Возвращает True/False."""
-    async with TAGS_SEMAPHORE:
-        params = base_params(s="post", limit="1", tags=tag)
-        text = await fetch_json(http_session, params, retries=2)
-        if not text:
-            return False
-        posts = parse_posts(text)
-        return bool(posts)
-
-
-@bot.slash_command(name='tags', description="🏷️ Список популярных тегов и их статус (есть ли арты)")
-async def tags_list(interaction: nextcord.Interaction):
-    if await reject_if_on_cooldown(interaction, TAGS_CD):
-        return
-    embed = nextcord.Embed(
-        title="🏷️ Доступные теги",
-        description="Проверяю наличие картинок по популярным тегам...",
-        color=0x3498db
-    )
-    embed.set_footer(text="⏳ Пожалуйста, подождите...",
-                     icon_url=bot.user.avatar.url if bot.user.avatar else None)
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
-    http_session = await get_session()
-    tags_to_check = POPULAR_TAGS[:20]
-
-    # Все запросы параллельно (ограничены семафором до 5 одновременно)
-    results = await asyncio.gather(
-        *[_check_tag(http_session, tag) for tag in tags_to_check],
-        return_exceptions=True
-    )
-
-    tags_with_images = [t for t, ok in zip(tags_to_check, results) if ok is True]
-    tags_without_images = [t for t, ok in zip(tags_to_check, results) if ok is not True]
-
-    embed_result = nextcord.Embed(
-        title="🏷️ Статус тегов",
-        description=f"Проверено {len(tags_to_check)} тегов из популярных",
-        color=0x2ecc71
-    )
-    if tags_with_images:
-        embed_result.add_field(
-            name=f"✅ Есть картинки ({len(tags_with_images)})",
-            value=", ".join(f"`{t}`" for t in tags_with_images),
-            inline=False
-        )
-    if tags_without_images:
-        shown = tags_without_images[:15]
-        tail = f" ... и ещё {len(tags_without_images) - 15}" if len(tags_without_images) > 15 else ""
-        embed_result.add_field(
-            name=f"❌ Нет картинок ({len(tags_without_images)})",
-            value=", ".join(f"`{t}`" for t in shown) + tail,
-            inline=False
-        )
-    embed_result.set_footer(text="💡 Найди свой тег и используй /gelbooru <тег>")
-
-    try:
-        await interaction.edit_original_message(embed=embed_result)
-    except NotFound:
+@bot.event
+async def on_close():
+    memory.save()
+    await booru.close_session()
+    if tg_client is not None:
         try:
-            await interaction.followup.send(embed=embed_result, ephemeral=True)
-        except Exception as e:
-            logger.error(f"[tags] Не удалось отправить результат: {e}")
-
-
-# ── /tagcheck ─────────────────────────────────────────────────────────────────
-
-@bot.slash_command(name='tagcheck', description="🔍 Проверить, есть ли на Gelbooru арты по тегу")
-async def tag_check(
-    interaction: nextcord.Interaction,
-    tag: str = nextcord.SlashOption(description="Тег для проверки", required=True),
-):
-    if not channel_allows_nsfw(interaction):
-        return await interaction.response.send_message("🔞 Пиздуй в NSFW канал!", ephemeral=True)
-    if await reject_if_on_cooldown(interaction, TAGCHECK_CD):
-        return
-
-    await interaction.response.defer()
-    clean_tag = tag.strip().replace(" ", "_")
-    http_session = await get_session()
-
-    # Два запроса параллельно
-    posts_params = base_params(s="post", limit="10", tags=clean_tag)
-    tag_info_params = base_params(s="tag", names=clean_tag)
-
-    posts_text, tag_text = await asyncio.gather(
-        fetch_json(http_session, posts_params),
-        fetch_json(http_session, tag_info_params),
-        return_exceptions=True
-    )
-
-    # Разбираем посты
-    count = 0
-    if isinstance(posts_text, str):
-        posts = parse_posts(posts_text)
-        count = len(posts) if posts else 0
-
-    # Разбираем инфо о теге
-    tag_count = "N/A"
-    if isinstance(tag_text, str):
-        try:
-            tag_data = json.loads(tag_text)
-            if isinstance(tag_data, dict):
-                tag_data = tag_data.get("tag", [])
-            tag_info = tag_data[0] if isinstance(tag_data, list) and tag_data else {}
-            tag_count = tag_info.get("count", "N/A")
+            await tg_client.disconnect()
         except Exception:
             pass
 
-    if count > 0:
-        embed = nextcord.Embed(
-            title=f"✅ Тег `{clean_tag}` активен!",
-            description=f"Найдено последних постов: **{count}** (всего: ~{tag_count})",
-            color=0x2ecc71
-        )
-        embed.add_field(name="💡 Используй", value=f"`/gelbooru {clean_tag}` для поиска картинки", inline=False)
-    else:
-        embed = nextcord.Embed(
-            title=f"❌ Тег `{clean_tag}` не найден",
-            description="По этому тегу нет изображений или он заблокирован.",
-            color=0xe74c3c
-        )
-        embed.add_field(
-            name="💡 Попробуй",
-            value="• Проверь правильность написания тега\n• Используй `/tags` для списка доступных тегов",
-            inline=False
-        )
-    await interaction.followup.send(embed=embed)
 
+async def start_health_server() -> None:
+    """HTTP-«пульс» для хостингов, которым нужен открытый порт (Render и т.п.).
 
-# ── /gelbooru ─────────────────────────────────────────────────────────────────
-
-# ── Богатый embed ─────────────────────────────────────────────────────────────
-RATING_LABELS = {
-    "general": "🟢 General",
-    "safe": "🟢 Safe",
-    "sensitive": "🟡 Sensitive",
-    "questionable": "🟠 Questionable",
-    "explicit": "🔴 Explicit",
-}
-
-
-def _rating_label(post: dict) -> str:
-    return RATING_LABELS.get((post.get("rating") or "").lower(), "—")
-
-
-def format_tags_preview(tags_str: str, limit: int = 14, maxlen: int = 950) -> str:
-    """Список тегов поста → компактная строка `tag` `tag` … +N (обрезка по длине)."""
-    tags = (tags_str or "").split()
-    if not tags:
-        return ""
-    shown = tags[:limit]
-    text = " ".join(f"`{t}`" for t in shown)
-    if len(tags) > limit:
-        text += f" … +{len(tags) - limit}"
-    return text[:maxlen]
-
-
-def post_page_url(post: dict) -> str:
-    """Ссылка на страницу поста на его сайте-источнике."""
-    pid = post.get("id", "")
-    site = post.get("_site")
-    if site == "Konachan":
-        return f"https://konachan.com/post/show/{pid}"
-    if site == "Safebooru":
-        return f"https://safebooru.org/index.php?page=post&s=view&id={pid}"
-    return f"https://gelbooru.com/index.php?page=post&s=view&id={pid}"
-
-
-def build_post_embed(post: dict, display_tag: str, size: int, filename: str,
-                     is_sample: bool) -> nextcord.Embed:
-    """Подробный embed: рейтинг, score, размер, разрешение, аффтор, теги, ссылки."""
-    post_id = post.get("id", "")
-    post_link = post_page_url(post)
-    width, height = post.get("width"), post.get("height")
-    source = (post.get("source") or "").strip()
-
-    embed = nextcord.Embed(
-        title="🖼 Результат по тегу",
-        description=f"`{display_tag}`",
-        color=0x00ff00,
-    )
-    embed.add_field(name="📊 Score", value=str(post.get("score", "N/A")), inline=True)
-    embed.add_field(name="🔞 Рейтинг", value=_rating_label(post), inline=True)
-    embed.add_field(name="📏 Размер", value=f"{size / (1024 * 1024):.1f} MB", inline=True)
-    if width and height:
-        embed.add_field(name="📐 Разрешение", value=f"{width}×{height}", inline=True)
-    embed.add_field(name="👤 Аффтор", value=str(post.get("owner") or "—"), inline=True)
-    if is_sample:
-        embed.add_field(name="🗜 Версия", value="сжатый sample", inline=True)
-
-    links = f"[Открыть пост]({post_link})"
-    if source.startswith("http"):
-        links += f" • [Источник]({source})"
-    embed.add_field(name="🔗 Ссылки", value=links, inline=False)
-
-    tags_preview = format_tags_preview(post.get("tags", ""))
-    if tags_preview:
-        embed.add_field(name="🏷️ Теги", value=tags_preview, inline=False)
-
-    embed.set_image(url=f"attachment://{filename}")
-    embed.set_footer(text=f"{post.get('_site', 'Gelbooru')} • ID {post_id}")
-    return embed
-
-
-async def build_candidate_payload(
-    http_session: aiohttp.ClientSession,
-    post: dict,
-    display_tag: str,
-    max_size: int,
-) -> dict | None:
-    """Скачивает медиа поста и готовит payload для отправки/редактирования.
-
-    Пробует original → sample_url (если оригинал слишком большой).
-    Возвращает {"content", "embed", "file"} или None (не влез / ошибка скачивания).
+    Включается только если хостинг задал переменную PORT.
     """
-    post_id = post.get("id", "")
-    original = post.get("file_url") or post.get("image")
-    sample = post.get("sample_url")
-    url_options = [u for u in (original, sample) if u]
-
-    for idx, url in enumerate(url_options):
-        is_sample = idx > 0
-        file_ext = url.split(".")[-1].split("?")[0].lower()
-        is_video = file_ext in ("webm", "mp4")
-
-        data, size, reason = await download_media(http_session, url, max_size)
-        if not data:
-            if reason == "too_big":
-                continue  # пробуем следующий URL (sample)
-            break  # ошибка скачивания — этот пост пропускаем
-
-        if is_video:
-            filename = f"gelbooru_{post_id or 'vid'}.{file_ext}"
-            file = nextcord.File(BytesIO(data), filename=filename)
-            post_link = post_page_url(post)
-            content = (
-                f"🎬 **Видео** `{display_tag}` • 📊 {post.get('score', 'N/A')} • "
-                f"🔞 {_rating_label(post)} • {size / (1024 * 1024):.1f} MB • "
-                f"[Открыть пост]({post_link})"
-            )
-            return {"content": content, "embed": None, "file": file, "_post": post}
-
-        if file_ext not in ("jpg", "jpeg", "png", "gif", "webp"):
-            file_ext = "png"
-        filename = f"gelbooru_{post_id or 'img'}.{file_ext}".replace("..", ".")
-        bio = BytesIO(data)
-        bio.seek(0)
-        file = nextcord.File(bio, filename=filename)
-        embed = build_post_embed(post, display_tag, size, filename, is_sample)
-        return {"content": None, "embed": embed, "file": file, "_post": post}
-
-    return None
-
-
-# ── Перебор кандидатов: следующий влезающий по размеру пост ────────────────────
-async def pop_next_payload(
-    http_session: aiohttp.ClientSession,
-    candidates: list[dict],
-    display_tag: str,
-    max_size: int,
-) -> dict | None:
-    """Достаёт из списка следующего кандидата, который успешно скачался и влез.
-
-    Мутирует candidates (pop слева). Возвращает None, если подходящих не осталось.
-    """
-    while candidates:
-        post = candidates.pop(0)
-        payload = await build_candidate_payload(http_session, post, display_tag, max_size)
-        if payload:
-            return payload
-    return None
-
-
-# ── Источники: Gelbooru + Konachan (Moebooru) ─────────────────────────────────
-KONACHAN_URL = "https://konachan.com/post.json"
-KONACHAN_MAX_TAGS = 6  # Konachan режет анонимов на ≤6 тегах (7 → HTTP 500)
-_MOEBOORU_RATING = {"s": "safe", "q": "questionable", "e": "explicit"}
-
-
-def normalize_konachan(post: dict) -> dict:
-    """Пост Konachan → общий вид (owner, словесный rating, метка сайта)."""
-    p = dict(post)
-    p["owner"] = post.get("author") or "—"
-    p["rating"] = _MOEBOORU_RATING.get((post.get("rating") or "").lower(),
-                                       post.get("rating"))
-    p["_site"] = "Konachan"
-    return p
-
-
-def by_score(posts: list[dict]) -> list[dict]:
-    return sorted(posts, key=lambda x: int(x.get("score", 0) or 0), reverse=True)
-
-
-# Балансный порог качества: держим самый высокий floor, при котором остаётся
-# достаточно постов; для нишевых тегов плавно ослабляем вплоть до 0.
-# Планка поднята (100/30/0) — отсекаем посредственное, в приоритете то, что
-# набрало много лайков. Для нишевых тегов floor плавно опускается до 0.
-QUALITY_FLOORS = [100, 30, 0]
-MIN_GOOD = 6
-
-
-def quality_floor(posts: list[dict], floors: list[int] = QUALITY_FLOORS) -> list[dict]:
-    """Отсекаем низкорейтинговый хвост, но не уходим ниже MIN_GOOD результатов.
-
-    floors — пороги score по убыванию. Для Gelbooru score измеряется сотнями,
-    для реакций Telegram — десятками, поэтому источник передаёт свои пороги.
-    """
-    ranked = by_score(posts)
-    for floor in floors:
-        good = [p for p in ranked if int(p.get("score", 0) or 0) >= floor]
-        if len(good) >= MIN_GOOD or floor == 0:
-            return good
-    return ranked
-
-
-# Потолок веса при взвешенном перемешивании. √score достигает 25 при score≈625,
-# поэтому по-настоящему залайканные арты получают ощутимо больший шанс оказаться
-# вверху (приоритет качества), но один мега-хит не монополизирует выдачу.
-WEIGHT_CAP = 25.0
-
-
-def weighted_score_shuffle(posts: list[dict]) -> list[dict]:
-    """Перемешивание с приоритетом по score: чем больше лайков, тем выше шанс
-    оказаться в начале — но порядок остаётся случайным, выдача не приедается.
-
-    Алгоритм Эфраимидиса–Спиракиса (взвешенная выборка без возврата):
-    ключ = u**(1/weight), сортировка по убыванию. Вес = √score с потолком
-    WEIGHT_CAP: приоритет лайкам сохраняется, но один мега-залайканный арт уже
-    не монополизирует топ — внутри «хорошего» тира выбор почти равномерный, и
-    выдача перестаёт приедаться.
-    """
-    def sort_key(p: dict) -> float:
-        score = int(p.get("score", 0) or 0)
-        weight = min(WEIGHT_CAP, max(1.0, score) ** 0.5) + 1.0  # √score с потолком, вес ≥ 1
-        u = random.random()
-        return u ** (1.0 / weight)
-
-    return sorted(posts, key=sort_key, reverse=True)
-
-
-# ── Память недавно показанных артов (чтобы выдача не повторялась) ──────────────
-# Переживает рестарт: пишется в JSON на диск и грузится при старте. Иначе на
-# хостинге каждый редеплой/краш обнулял бы память и повторы возвращались с нуля.
-RECENT_MAX = 500        # сколько последних артов помним на каждый тег-запрос
-RECENT_MAX_KEYS = 500   # сколько тег-запросов держим, прежде чем вытеснять старые
-CANDIDATE_LIMIT = 50    # сколько кандидатов берём в работу после сортировки
-RECENT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "recent_shown.json")
-_recent_shown: dict[str, deque] = defaultdict(lambda: deque(maxlen=RECENT_MAX))
-
-
-def load_recent_shown() -> None:
-    """Грузит память показанных артов с диска (один раз при старте бота)."""
-    try:
-        with open(RECENT_FILE, encoding="utf-8") as f:
-            data = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
+    port = os.environ.get("PORT")
+    if not (port and port.isdigit()):
         return
-    if not isinstance(data, dict):
-        return
-    for key, uids in data.items():
-        if isinstance(uids, list):
-            _recent_shown[key] = deque(uids[-RECENT_MAX:], maxlen=RECENT_MAX)
-    logger.info(f"🗂 Память показанных артов загружена: {len(_recent_shown)} тег-запросов")
+    from aiohttp import web
+
+    async def health(_request):
+        return web.Response(text=f"ok, ready={bot.is_ready()}")
+
+    app = web.Application()
+    app.router.add_get("/", health)
+    app.router.add_get("/health", health)
+    runner = web.AppRunner(app, access_log=None)
+    await runner.setup()
+    await web.TCPSite(runner, "0.0.0.0", int(port)).start()
+    logger.info(f"💓 Health-сервер слушает порт {port}")
 
 
-def save_recent_shown() -> None:
-    """Атомарно сохраняет память на диск; при переполнении вытесняет старые ключи.
-
-    Словари Python хранят порядок вставки, а свежеиспользованный ключ мы двигаем
-    в конец (см. run_booru_search), поэтому срез с начала = выкидываем давно не
-    запрашиваемые теги (псевдо-LRU).
-    """
+def main() -> None:
+    token = env_any("DISCORD_BOT_TOKEN")
+    if not token:
+        raise SystemExit("❌ Не задан токен бота: переменная DISCORD_BOT_TOKEN "
+                         "(в окружении или в файле .env рядом с ботом).")
+    memory.load()
+    bot.loop.create_task(memory.autosave_loop())
+    bot.loop.create_task(start_health_server())
     try:
-        items = list(_recent_shown.items())
-        if len(items) > RECENT_MAX_KEYS:
-            for key, _ in items[:len(items) - RECENT_MAX_KEYS]:
-                _recent_shown.pop(key, None)
-            items = items[-RECENT_MAX_KEYS:]
-        data = {key: list(dq) for key, dq in items if dq}
-        tmp = RECENT_FILE + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False)
-        os.replace(tmp, RECENT_FILE)
-    except OSError as e:
-        logger.warning(f"Не удалось сохранить память показанных артов: {e}")
-
-
-def post_uid(post: dict) -> str:
-    """Стабильный идентификатор арта (md5, иначе сайт+id).
-
-    Для Telegram-альбомов источник кладёт общий `_uid` (по grouped_id), чтобы
-    анти-повтор считал весь пост за один арт и не показывал его повторно.
-    """
-    uid = post.get("_uid")
-    if uid:
-        return uid
-    md5 = (post.get("md5") or "").lower()
-    return md5 or f"{post.get('_site')}:{post.get('id')}"
-
-
-def recent_key(label: str, tags_clean: list[str]) -> str:
-    """Ключ памяти: источник + набор тегов (порядок тегов не важен)."""
-    return label + "|" + ",".join(sorted(tags_clean))
-
-
-def dedup_posts(posts: list[dict]) -> list[dict]:
-    """Убираем повторы: один арт = один md5 (работает и между сайтами)."""
-    seen, out = set(), []
-    for p in posts:
-        md5 = (p.get("md5") or "").lower()
-        key = md5 if md5 else (p.get("_site"), p.get("id"))
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(p)
-    return out
-
-
-def lead_by_score(posts: list[dict], groups: set[str] | None = None) -> list[dict]:
-    """Ставит в голову списка лучший по score арт — как в Lawliet (показываем
-    самый залайканный из ещё не виденных). При запросе части тела champion берём
-    из верхнего focus-тира, иначе нерелевантный мега-хит обогнал бы релевантные.
-    Хвост не трогаем: там остаётся focus-порядок и weighted-разнообразие.
-    """
-    if len(posts) < 2:
-        return posts
-    if groups:
-        top = _focus_tier(posts[0], groups)          # pool уже отсортирован по тиру
-        eligible = [i for i, p in enumerate(posts) if _focus_tier(p, groups) == top]
-    else:
-        eligible = range(len(posts))
-    best = max(eligible, key=lambda i: int(posts[i].get("score", 0) or 0))
-    if best == 0:
-        return posts
-    return [posts[best], *posts[:best], *posts[best + 1:]]
-
-
-def order_candidates(pool: list[dict], recent, groups: set[str] | None = None) -> list[dict]:
-    """Финальный порядок кандидатов к показу:
-      • ещё не показанные — впереди, лучший по score в голове (Lawliet-style);
-      • если показано всё (свежих нет) — мягкая деградация: арты, виденные давно,
-        идут раньше недавних повторов; score — вторичный критерий.
-    Память (recent) — deque uid'ов в порядке показа; проверка O(1) через set
-    (у deque оператор `in` линейный, на окне в сотни артов это заметно).
-    """
-    seen = set(recent)
-    unseen = [p for p in pool if post_uid(p) not in seen]
-    if unseen:
-        return lead_by_score(unseen, groups)
-    age = {uid: i for i, uid in enumerate(recent)}   # меньший индекс = показывали давнее
-    return sorted(pool, key=lambda p: (age.get(post_uid(p), -1),
-                                       -int(p.get("score", 0) or 0)))
-
-
-def remember_shown(rkey: str, uid: str) -> None:
-    """Запоминаем показанный арт: добавляем в окно, двигаем ключ в конец (псевдо-LRU)
-    и атомарно пишем на диск — память переживает рестарт хостинга.
-    """
-    recent = _recent_shown[rkey]
-    recent.append(uid)
-    _recent_shown.pop(rkey, None)
-    _recent_shown[rkey] = recent
-    save_recent_shown()
-
-
-# ── Ротация страниц: немного разнообразия без потери качества ──────────────────
-# При sort:score номер страницы = ранг по лайкам: страница 0 — топ-100, страница
-# N — арты рангом N·100…(N+1)·100. Глубокие страницы = посредственные арты.
-# Поэтому ротацию держим МЕЛКОЙ (только страницы 1..DEPTH) и смещаем выбор к
-# началу: страница 1 куда вероятнее страницы DEPTH. Так пул всё равно меняется
-# от запроса к запросу (нет повторов при памяти RECENT_MAX), но почти все
-# кандидаты — высокорейтинговые. Качество держит страница 0 (всегда в выборке).
-FETCH_PAGES = 6          # сколько страниц тянем за запрос (1 топовая + ротация)
-FETCH_PAGE_DEPTH = 10    # ротация ТОЛЬКО по неглубоким страницам 1..DEPTH;
-                         # DEPTH > (FETCH_PAGES-1), иначе уклон к началу пропадёт
-
-
-def rotating_pages(n: int = FETCH_PAGES, depth: int = FETCH_PAGE_DEPTH) -> list[int]:
-    """Страница 0 (топ по score) + (n-1) неглубоких страниц с уклоном к началу.
-
-    Выбор без возврата с приоритетом мелких страниц (алгоритм
-    Эфраимидиса–Спиракиса): ключ = u**page, берём наибольшие. Чем меньше номер
-    страницы, тем больше ключ → страница 1 почти всегда впереди страницы DEPTH.
-    Высокий score кандидатов сохраняется, а пул при этом ротируется.
-    """
-    if n <= 1:
-        return [0]
-    k = min(n - 1, depth)
-    ranked = sorted(range(1, depth + 1), key=lambda p: random.random() ** p, reverse=True)
-    return [0] + ranked[:k]
-
-
-async def fetch_gelbooru(http_session: aiohttp.ClientSession,
-                         tags_clean: list[str], extra_tags: list[str]) -> list[dict]:
-    """Запрос к Gelbooru → сырые посты (без локального фильтра контента).
-
-    Тянем несколько страниц параллельно (см. rotating_pages) — широкий и
-    ротируемый пул убирает повторы. Дедуп делается выше по стеку (dedup_posts).
-    """
-    # sort:score — берём самые заплюсованные арты (качество), а не случайные.
-    # safe/general режем на сервере. Короткие блэклисты (возраст/AI/HARD)
-    # уходят в запрос; полный BLACKLIST не шлём (раздувал URL → HTTP 413).
-    parts = (tags_clean + extra_tags
-             + ["sort:score", "-rating:safe", "-rating:general"])
-    tags_query = (" ".join(parts) + " "
-                  + CRITICAL_BLACKLIST + " " + AI_BLACKLIST + " " + HARD_BLACKLIST)
-    texts = await asyncio.gather(*[
-        fetch_json(http_session,
-                   base_params(s="post", limit="100", pid=str(pg), tags=tags_query),
-                   retries=3)
-        for pg in rotating_pages()
-    ])
-    posts: list[dict] = []
-    for text in texts:
-        if text:
-            posts.extend(parse_posts(text) or [])
-    for p in posts:
-        p["_site"] = "Gelbooru"
-    return posts
-
-
-async def _konachan_page(http_session: aiohttp.ClientSession,
-                         query_tags: list[str], page: int) -> list[dict]:
-    """Одна страница Konachan (Moebooru `page` — 1-based). Возвращает посты."""
-    params = {"tags": " ".join(query_tags), "limit": "100", "page": str(page)}
-    text = None
-    for attempt in range(1, 3):
-        try:
-            async with http_session.get(KONACHAN_URL, params=params, headers=headers,
-                                        timeout=API_TIMEOUT, proxy=PROXY) as resp:
-                if resp.status != 200:
-                    logger.warning(f"[konachan] status={resp.status} page={page}")
-                    return []
-                text = await resp.text()
-                break
-        except (aiohttp.ServerTimeoutError, asyncio.TimeoutError,
-                aiohttp.ClientConnectionError) as e:
-            logger.warning(f"[konachan] timeout/disconnect page={page} attempt={attempt}: {e}")
-            if attempt < 2:
-                await asyncio.sleep(1.0)
-            else:
-                return []
-        except Exception as e:
-            logger.warning(f"[konachan] error page={page}: {e}")
-            return []
-
-    try:
-        data = json.loads(text)
-    except Exception:
-        return []
-    if not isinstance(data, list):
-        return []
-    return [normalize_konachan(p) for p in data]
-
-
-async def fetch_konachan(http_session: aiohttp.ClientSession,
-                         tags_clean: list[str], extra_tags: list[str]) -> list[dict]:
-    """Запрос к Konachan (Moebooru) → нормализованные посты.
-
-    Из-за лимита ≤6 тегов блэклисты НЕ шлём — контент фильтрует post_is_clean
-    локально. На сервере отсекаем только safe (`-rating:s`). Несколько страниц
-    с ротацией (см. rotating_pages) расширяют пул и убирают повторы.
-    """
-    base = list(tags_clean) + list(extra_tags)
-    query_tags = base + ["-rating:s", "order:score"]
-    if len(query_tags) > KONACHAN_MAX_TAGS:
-        query_tags = (base + ["-rating:s"])[:KONACHAN_MAX_TAGS]
-
-    # rotating_pages() даёт 0-based номера; Moebooru считает с 1 → +1.
-    pages = [p + 1 for p in rotating_pages()]
-    results = await asyncio.gather(*[
-        _konachan_page(http_session, query_tags, pg) for pg in pages
-    ])
-    posts: list[dict] = []
-    for chunk in results:
-        posts.extend(chunk)
-    return posts
-
-
-# ── Источник: Safebooru (safe-контент, Gelbooru 0.2 API) ──────────────────────
-SAFEBOORU_URL = "https://safebooru.org/index.php"
-
-
-def normalize_safebooru(post: dict) -> dict:
-    """Пост Safebooru → общий вид (md5 из hash, метка сайта)."""
-    p = dict(post)
-    p["md5"] = (post.get("hash") or "").lower()
-    p["_site"] = "Safebooru"
-    return p
-
-
-async def fetch_safebooru(http_session: aiohttp.ClientSession,
-                          tags_clean: list[str], extra_tags: list[str]) -> list[dict]:
-    """Запрос к Safebooru → нормализованные посты.
-
-    Safebooru хостит только safe-контент, поэтому серверный фильтр рейтинга не
-    нужен. Блэклисты (возраст/AI/HARD) всё равно шлём — у safe-арта может быть
-    нежелательный тег. sort:score — наверх самые залайканные.
-    """
-    parts = tags_clean + extra_tags + ["sort:score"]
-    tags_query = (" ".join(parts) + " "
-                  + CRITICAL_BLACKLIST + " " + AI_BLACKLIST + " " + HARD_BLACKLIST)
-
-    # Свои параметры (без api_key Gelbooru — Safebooru их не ждёт). Несколько
-    # страниц с ротацией (см. rotating_pages) расширяют пул и убирают повторы.
-    def _params(pg: int) -> dict:
-        return {"page": "dapi", "s": "post", "q": "index", "json": "1",
-                "limit": "100", "pid": str(pg), "tags": tags_query}
-
-    texts = await asyncio.gather(*[
-        fetch_json(http_session, _params(pg), base_url=SAFEBOORU_URL, retries=3)
-        for pg in rotating_pages()
-    ])
-    posts: list[dict] = []
-    for text in texts:
-        if text:
-            posts.extend(parse_posts(text) or [])
-    return [normalize_safebooru(p) for p in posts]
-
-
-async def run_booru_search(
-    interaction: nextcord.Interaction,
-    tags: tuple,
-    *,
-    fetch_fn,
-    cooldown: CooldownManager,
-    label: str,
-    require_nsfw: bool = True,
-    require_nudity: bool = True,
-):
-    """Общая логика поиска. Источники отличаются только fetch_fn и флагами.
-
-    require_nsfw  — команда работает лишь в NSFW-каналах/личке (для Gelbooru/Konachan).
-    require_nudity — «строгий» фильтр требует наготы; для Safebooru (safe-контент)
-                     оба флага выключены, но система блокировки тегов та же.
-    """
-    if require_nsfw and not channel_allows_nsfw(interaction):
-        return await interaction.response.send_message("🔞 Пиздуй в NSFW канал!", ephemeral=True)
-    if await reject_if_on_cooldown(interaction, cooldown):
-        return
-
-    try:
-        await interaction.response.defer()
-    except (NotFound, nextcord.HTTPException, aiohttp.ClientError,
-            asyncio.TimeoutError) as e:
-        # интеракция протухла / сеть моргнула во время реконнекта — продолжать нечего
-        logger.warning(f"[{label}] defer не удался, отмена: {e}")
-        return
-
-    # Обработка тегов
-    def clean(t):
-        return t.strip().replace(" ", "_") if t and t.strip() else None
-
-    tags_clean = [t for t in (clean(x) for x in tags) if t]
-    display_tag = " + ".join([x for x in tags if x])
-
-    if not tags_clean:
-        return await interaction.followup.send("❌ Укажи хотя бы один тег.")
-
-    # Спец-обработка Kanzaki Hideri — шлём заготовленную картинку (до блокировок)
-    if any(tag_is_kanzaki_hideri(t) for t in tags_clean):
-        if os.path.isfile(KANZAKI_HIDERI_IMAGE):
-            return await interaction.followup.send(
-                file=nextcord.File(KANZAKI_HIDERI_IMAGE)
-            )
-        return await interaction.followup.send("🚫 Один из тегов заблокирован.", ephemeral=True)
-
-    # Проверка блокированных тегов (точное совпадение, без ложных срабатываний)
-    for t in tags_clean:
-        if tag_triggers_venti(t):
-            return await interaction.followup.send(VENTI_WARNING)
-        if tag_triggers_lgbt_joke(t):
-            return await interaction.followup.send(LGBT_JOKE_WARNING)
-        if tag_is_blocked(t):
-            return await interaction.followup.send("🚫 Один из тегов заблокирован.", ephemeral=True)
-
-    allowed = set(tags_clean)
-    # Запрошенные телесные группы → приоритет фокуса + сужение «наготы».
-    requested_groups = focus_groups_for(tags_clean)
-    req_nudity = requested_nudity_tags(requested_groups)
-    http_session = await get_session()
-
-    try:
-        # 1) Сырые посты по тегу + строгий фильтр. Для NSFW-источников «строгий»
-        #    = требуется нагота; для Safebooru (require_nudity=False) — только блэклист.
-        raw = dedup_posts(await fetch_fn(http_session, tags_clean, []))
-        strict = [p for p in raw
-                  if post_is_clean(p, allowed, require_nudity=require_nudity,
-                                   nudity_tags=req_nudity)]
-
-        # 2) Мало строгих — на NSFW-источниках добираем запросом с nude.
-        #    На Safebooru это бессмысленно (тот же safe-запрос), поэтому пропускаем.
-        if require_nudity and len(strict) < MIN_POOL:
-            raw = dedup_posts(raw + await fetch_fn(http_session, tags_clean, ["nude"]))
-            strict = [p for p in raw
-                      if post_is_clean(p, allowed, require_nudity=True,
-                                       nudity_tags=req_nudity)]
-
-        # 3) Порог качества + умное ослабление. Посты уже приходят с sort:score,
-        #    здесь отсекаем низкорейтинговый хвост и перемешиваем взвешенно
-        #    (по score) — самые залайканные в приоритете, но выдача не приедается.
-        #    Раздетое (strict) всегда идёт первым; одетое добираем, только если мало.
-        #    focus_rerank поднимает арт с фокусом на запрошенной части тела
-        #    (внутри тира порядок качества из weighted_score_shuffle сохраняется).
-        strict_q = focus_rerank(weighted_score_shuffle(quality_floor(strict)),
-                                requested_groups)
-        strict_count = len(strict_q)
-
-        if not require_nudity or strict_count >= MIN_POOL:
-            pool = strict_q
-        else:
-            broad = [p for p in raw if post_is_clean(p, allowed, require_nudity=False)]
-            strict_obj = {id(p) for p in strict}
-            extra = focus_rerank(
-                weighted_score_shuffle(
-                    quality_floor([p for p in broad if id(p) not in strict_obj])
-                ),
-                requested_groups,
-            )
-            pool = strict_q + extra
-
-        if not pool:
-            return await interaction.followup.send(
-                f"❌ По тегу `{display_tag}` на {label} ничего не найдено."
-            )
-
-        # Кандидаты к показу: ещё не виденные впереди (лучший по score — первым,
-        # как в Lawliet), а если всё уже показано — деградируем к давно виденным,
-        # чтобы не повторять только что отправленное.
-        rkey = recent_key(label, tags_clean)
-        candidates = order_candidates(pool, _recent_shown[rkey], requested_groups)[:CANDIDATE_LIMIT]
-
-        max_size = max_upload_size(interaction)
-
-        # 4) Отправка с самоисцелением: при 413 от Discord — следующий кандидат.
-        payload = await pop_next_payload(http_session, candidates, display_tag, max_size)
-        sent_msg = None
-        attempts = 0
-        while payload is not None and attempts < 8:
-            attempts += 1
-            try:
-                sent_msg = await interaction.followup.send(
-                    content=payload["content"],
-                    embed=payload["embed"],
-                    file=payload["file"],
-                )
-                remember_shown(rkey, post_uid(payload["_post"]))  # запомнили + LRU + на диск
-                break
-            except nextcord.HTTPException as e:
-                if getattr(e, "status", None) == 413:
-                    logger.warning(f"[{label}] 413 на отправке — пробую следующего кандидата")
-                    payload = await pop_next_payload(http_session, candidates, display_tag, max_size)
-                    continue
-                raise
-
-        if sent_msg is None:
-            return await safe_followup(
-                interaction,
-                f"❌ По тегу `{display_tag}` все подходящие файлы слишком большие для загрузки."
-            )
-
-    except NotFound as nf:
-        logger.warning(f"[{label}] Interaction expired: {nf}")
-    except Exception as e:
-        logger.error(f"--- КРИТИЧЕСКАЯ ОШИБКА ({label}) ---\nТип: {type(e).__name__}\nОписание: {e}\n")
-        await safe_followup(interaction, "❌ Произошла внутренняя ошибка. Проверь консоль бота.")
-
-
-@bot.slash_command(
-    name='gelbooru',
-    description="🔞 Арт по тегам с Gelbooru — приоритет твоему запросу (до 4 тегов)",
-)
-async def gelbooru(
-    interaction: nextcord.Interaction,
-    tag: str = nextcord.SlashOption(description="Главный тег для поиска", required=True),
-    tag2: str = nextcord.SlashOption(description="Доп. тег для сужения (необязательно)", required=False, default=None),
-    tag3: str = nextcord.SlashOption(description="Доп. тег для сужения (необязательно)", required=False, default=None),
-    tag4: str = nextcord.SlashOption(description="Доп. тег для сужения (необязательно)", required=False, default=None),
-):
-    await run_booru_search(
-        interaction, (tag, tag2, tag3, tag4),
-        fetch_fn=fetch_gelbooru, cooldown=GELBOORU_CD, label="Gelbooru",
-    )
-
-
-@bot.slash_command(
-    name='konachan',
-    description="🔞 Арт по тегам с Konachan — аниме-арт высокого качества (до 4 тегов)",
-)
-async def konachan(
-    interaction: nextcord.Interaction,
-    tag: str = nextcord.SlashOption(description="Главный тег для поиска", required=True),
-    tag2: str = nextcord.SlashOption(description="Доп. тег для сужения (необязательно)", required=False, default=None),
-    tag3: str = nextcord.SlashOption(description="Доп. тег для сужения (необязательно)", required=False, default=None),
-    tag4: str = nextcord.SlashOption(description="Доп. тег для сужения (необязательно)", required=False, default=None),
-):
-    await run_booru_search(
-        interaction, (tag, tag2, tag3, tag4),
-        fetch_fn=fetch_konachan, cooldown=KONACHAN_CD, label="Konachan",
-    )
-
-
-@bot.slash_command(
-    name='safebooru',
-    description="🟢 Safe-арт по тегам с Safebooru — без NSFW, в любом канале (до 4 тегов)",
-)
-async def safebooru(
-    interaction: nextcord.Interaction,
-    tag: str = nextcord.SlashOption(description="Главный тег для поиска", required=True),
-    tag2: str = nextcord.SlashOption(description="Доп. тег для сужения (необязательно)", required=False, default=None),
-    tag3: str = nextcord.SlashOption(description="Доп. тег для сужения (необязательно)", required=False, default=None),
-    tag4: str = nextcord.SlashOption(description="Доп. тег для сужения (необязательно)", required=False, default=None),
-):
-    # Safe-контент → работает в любом канале и не требует наготы. Система
-    # блокировки тегов (venti/lgbt/kanzaki/блэклист) — та же, что у /gelbooru.
-    await run_booru_search(
-        interaction, (tag, tag2, tag3, tag4),
-        fetch_fn=fetch_safebooru, cooldown=SAFEBOORU_CD, label="Safebooru",
-        require_nsfw=False, require_nudity=False,
-    )
-
-
-# ── /tg — арты из Telegram-каналов ─────────────────────────────────────────────
-
-# Discord принимает максимум 10 вложений в одном сообщении.
-DISCORD_MAX_FILES = 10
-
-
-def _is_video_msg(m) -> bool:
-    """True, если сообщение TG — видео/гиф (по расширению файла)."""
-    return tg_source.media_ext(m) in ("mp4", "webm", "mov", "m4v", "gif")
-
-
-async def build_tg_payload(post: dict, max_size: int) -> dict | None:
-    """Готовит пост целиком к отправке в Discord: все картинки и видео поста.
-
-    Медиа складываются в исходном порядке, пока укладываются в лимит Discord на
-    ВСЁ сообщение (не на отдельный файл). Не влезшие файлы или слишком тяжёлое
-    видео обозначаются ссылкой «Открыть пост» — так пост не теряется целиком.
-    """
-    msg = post["_msg"]
-    peer = post.get("_peer")
-    album_msgs = await tg_source.fetch_album_messages(tg_client, peer, msg) if peer else [msg]
-
-    media_msgs = [m for m in album_msgs if tg_source.has_visual_media(m)]
-    if not media_msgs:
-        return None
-
-    has_video = any(_is_video_msg(m) for m in media_msgs)
-    files = []
-    total_size = 0
-    skipped = 0
-    for m in media_msgs:
-        if len(files) >= DISCORD_MAX_FILES:
-            skipped += 1
-            continue
-        remaining = max_size - total_size
-        # Заранее отсекаем то, что заведомо не влезет в остаток лимита сообщения.
-        f = getattr(m, "file", None)
-        approx = getattr(f, "size", None) if f else None
-        if approx and approx > remaining:
-            skipped += 1
-            continue
-        data, size, reason = await tg_source.download_media(tg_client, m, remaining)
-        if not data:
-            skipped += 1
-            continue
-        ext = tg_source.media_ext(m)
-        filename = f"tg_{post['_alias']}_{m.id}.{ext}".replace("..", ".")
-        bio = BytesIO(data)
-        bio.seek(0)
-        files.append(nextcord.File(bio, filename=filename))
-        total_size += size
-
-    link = tg_source.post_link(post)
-    reactions = post.get("score", 0)
-    icon = "🎬" if has_video else "🖼"
-
-    # Не влезло ничего, но медиа в посте было (тяжёлое видео/крупный альбом) —
-    # отдаём подпись + ссылку, чтобы пост не пропал совсем.
-    if not files:
-        if not link:
-            return None
-        parts = [f"{icon} **{post['_alias']}** • ❤️ {reactions}",
-                 "⬆️ файлы слишком большие — смотри в источнике",
-                 f"[Открыть пост]({link})"]
-        return {"content": " • ".join(parts), "embed": None, "files": [], "_post": post}
-
-    parts = [f"{icon} **{post['_alias']}** • ❤️ {reactions}"]
-    if len(files) > 1:
-        parts.append(f"📎 {len(files)} файлов")
-    if skipped:
-        parts.append(f"➕ ещё {skipped} в посте")
-    if link:
-        parts.append(f"[Открыть пост]({link})")
-    return {"content": " • ".join(parts), "embed": None, "files": files, "_post": post}
-
-
-async def run_tg_search(interaction: nextcord.Interaction, alias: str | None):
-    """Достать топовый по реакциям арт из выбранного (или случайного) канала."""
-    label = "Telegram"
-    if not channel_allows_nsfw(interaction):
-        return await interaction.response.send_message("🔞 Пиздуй в NSFW канал!", ephemeral=True)
-    if await reject_if_on_cooldown(interaction, TG_CD):
-        return
-
-    if tg_client is None:
-        return await interaction.response.send_message(
-            "⚠️ Telegram-источник не настроен (нет TG_API_ID/TG_API_HASH или сессии).",
-            ephemeral=True,
-        )
-
-    channels = tg_source.load_channels()
-    if not channels:
-        return await interaction.response.send_message(
-            "⚠️ Список каналов пуст — заполни `tg_channels.json`.", ephemeral=True
-        )
-
-    if alias:
-        chosen = next((c for c in channels if c["alias"].lower() == alias.lower()), None)
-        if chosen is None:
-            avail = ", ".join(f"`{c['alias']}`" for c in channels)
-            return await interaction.response.send_message(
-                f"❌ Канал `{alias}` не найден. Доступны: {avail}", ephemeral=True
-            )
-    else:
-        chosen = random.choice(channels)
-
-    try:
-        await interaction.response.defer()
-    except (NotFound, nextcord.HTTPException) as e:
-        logger.warning(f"[{label}] defer не удался: {e}")
-        return
-
-    try:
-        raw = await tg_source.fetch_channel_arts(tg_client, chosen["alias"], chosen["peer"])
-        if not raw:
-            return await interaction.followup.send(
-                f"❌ В канале `{chosen['alias']}` не нашлось подходящих артов."
-            )
-
-        # Порог реакций (мягко опускается) → взвешенный рандом → память показанных.
-        pool = weighted_score_shuffle(quality_floor(raw, TG_REACTION_FLOORS))
-        rkey = recent_key(label, [chosen["alias"]])
-        candidates = order_candidates(pool, _recent_shown[rkey])[:CANDIDATE_LIMIT]
-        max_size = max_upload_size(interaction)
-
-        payload = None
-        while candidates and payload is None:
-            payload = await build_tg_payload(candidates.pop(0), max_size)
-
-        sent_msg = None
-        attempts = 0
-        while payload is not None and attempts < 8:
-            attempts += 1
-            try:
-                sent_msg = await interaction.followup.send(
-                    content=payload["content"], embed=payload["embed"], files=payload["files"]
-                )
-                remember_shown(rkey, post_uid(payload["_post"]))  # +персист (раньше терялось при рестарте)
-                break
-            except nextcord.HTTPException as e:
-                if getattr(e, "status", None) == 413:
-                    payload = None
-                    while candidates and payload is None:
-                        payload = await build_tg_payload(candidates.pop(0), max_size)
-                    continue
-                raise
-
-        if sent_msg is None:
-            return await safe_followup(
-                interaction,
-                f"❌ В канале `{chosen['alias']}` подходящие файлы слишком большие для загрузки."
-            )
-    except NotFound:
-        logger.warning(f"[{label}] Interaction expired")
-    except Exception as e:
-        logger.error(f"--- КРИТИЧЕСКАЯ ОШИБКА ({label}) ---\nТип: {type(e).__name__}\nОписание: {e}\n")
-        await safe_followup(interaction, "❌ Произошла внутренняя ошибка. Проверь консоль бота.")
-
-
-@bot.slash_command(name="tg", description="🔞 Арт из телеграм канала")
-async def tg_command(
-    interaction: nextcord.Interaction,
-    channel: str = nextcord.SlashOption(
-        name="channel",
-        description="Канал из списка (пусто — случайный)",
-        required=False,
-        default=None,
-        autocomplete=True,
-    ),
-):
-    await run_tg_search(interaction, channel)
-
-
-@tg_command.on_autocomplete("channel")
-async def tg_command_autocomplete(interaction: nextcord.Interaction, value: str):
-    aliases = [c["alias"] for c in tg_source.load_channels()]
-    if value:
-        aliases = [a for a in aliases if value.lower() in a.lower()]
-    await interaction.response.send_autocomplete(aliases[:25])
+        bot.run(token)
+    finally:
+        memory.save()
 
 
 if __name__ == "__main__":
-    token = os.environ.get("DISCORD_BOT_TOKEN")
-    if not token:
-        raise SystemExit(
-            "❌ Не задан токен бота. Установи переменную окружения DISCORD_BOT_TOKEN.\n"
-            "   Пример: export DISCORD_BOT_TOKEN='ваш_токен'"
-        )
-    bot.run(token)
+    main()

@@ -1,0 +1,10 @@
+.git
+.env
+*.session
+*.session-journal
+*.log
+*.bak
+__pycache__/
+recent_shown.json*
+data/
+файлы губштейна/

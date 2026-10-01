@@ -7,6 +7,7 @@ TG_API_ID / TG_API_HASH из переменных окружения.
 import json
 import os
 import logging
+import time
 
 from telethon import TelegramClient
 from telethon.sessions import StringSession
@@ -125,51 +126,77 @@ def has_visual_media(msg) -> bool:
     return mime.startswith("image/") or mime.startswith("video/")
 
 
-def post_is_ad(msg) -> bool:
-    """Мягкая эвристика рекламы: нет картинки / кнопки-ссылки / рекламные слова."""
-    if not has_visual_media(msg):
+def post_is_ad(msgs) -> bool:
+    """Мягкая эвристика рекламы для поста (одиночного или альбома целиком).
+
+    Реклама: ни одной картинки/видео, инлайн-кнопки или рекламные слова в
+    подписи. У альбома подпись висит лишь на одном сообщении — поэтому решение
+    принимается по всему альбому, а не по каждой картинке отдельно.
+    """
+    if not isinstance(msgs, (list, tuple)):
+        msgs = [msgs]
+    if not any(has_visual_media(m) for m in msgs):
         return True
-    if getattr(msg, "reply_markup", None) is not None:  # инлайн-кнопки
-        return True
-    text = (getattr(msg, "message", None) or "").lower()
-    if any(kw in text for kw in AD_KEYWORDS):
-        return True
+    for m in msgs:
+        if getattr(m, "reply_markup", None) is not None:  # инлайн-кнопки
+            return True
+        text = (getattr(m, "message", None) or "").lower()
+        if any(kw in text for kw in AD_KEYWORDS):
+            return True
     return False
+
+
+# Скан канала кэшируется: повторный /tg по тому же каналу не листает историю заново.
+SCAN_TTL = 600.0
+_scan_cache: dict[str, tuple[float, list[dict]]] = {}
 
 
 async def fetch_channel_arts(client: TelegramClient, alias: str, peer: str,
                              limit: int = HISTORY_LIMIT) -> list[dict]:
     """Просмотреть историю канала → список арт-постов (реклама отсеяна).
 
-    Каждый пост: {id, score(=реакции), _site, _alias, _username, _msg, caption}.
+    Альбом = один пост. Каждый пост: {id, score(=реакции), _site, _alias,
+    _username, _peer_id, _peer, _uid, _msg, _msgs, caption}.
     """
+    hit = _scan_cache.get(alias)
+    if hit and time.monotonic() - hit[0] < SCAN_TTL:
+        return hit[1]
+
     peer_val = _peer_value(peer)
     username = peer_val[1:] if isinstance(peer_val, str) and peer_val.startswith("@") else None
     peer_id = peer_val if isinstance(peer_val, int) else None
-    posts: list[dict] = []
+    groups: dict[str, list] = {}
     try:
         async for msg in client.iter_messages(peer_val, limit=limit):
-            if post_is_ad(msg):
-                continue
-            # Альбом = один арт: общий uid по grouped_id, чтобы анти-повтор не
-            # показывал те же картинки повторно через другого участника альбома.
             gid = getattr(msg, "grouped_id", None)
-            uid = f"TG:{alias}:g{gid}" if gid else f"TG:{alias}:{msg.id}"
-            posts.append({
-                "id": msg.id,
-                "score": reaction_count(msg),
-                "_site": f"TG:{alias}",
-                "_alias": alias,
-                "_username": username,
-                "_peer_id": peer_id,
-                "_peer": peer_val,
-                "_uid": uid,
-                "_msg": msg,
-                "caption": (getattr(msg, "message", None) or "")[:200],
-            })
+            groups.setdefault(f"g{gid}" if gid else str(msg.id), []).append(msg)
     except Exception as e:
-        logger.error(f"[tg] ошибка чтения канала {alias}: {e}")
+        logger.error(f"[tg] ошибка чтения канала {alias}: {type(e).__name__}: {e}")
         return []
+
+    posts: list[dict] = []
+    for key, msgs in groups.items():
+        if post_is_ad(msgs):
+            continue
+        msgs.sort(key=lambda m: m.id)
+        head = msgs[0]
+        caption = next((m.message for m in msgs if getattr(m, "message", None)), "")
+        posts.append({
+            "id": head.id,
+            # реакции у альбома висят на одном из сообщений — берём максимум
+            "score": max(reaction_count(m) for m in msgs),
+            "_site": f"TG:{alias}",
+            "_alias": alias,
+            "_username": username,
+            "_peer_id": peer_id,
+            "_peer": peer_val,
+            # общий uid альбома: анти-повтор не покажет его же через другую картинку
+            "_uid": f"TG:{alias}:{key}",
+            "_msg": head,
+            "_msgs": msgs,
+            "caption": caption[:200],
+        })
+    _scan_cache[alias] = (time.monotonic(), posts)
     return posts
 
 
@@ -195,14 +222,22 @@ async def download_media(client: TelegramClient, msg, max_size: int):
 
 
 async def fetch_album_messages(client: TelegramClient, peer, msg) -> list:
-    """Вернуть все сообщения альбома (grouped_id), или [msg] если пост одиночный."""
+    """Вернуть все сообщения альбома (grouped_id), или [msg] если пост одиночный.
+
+    Скан канала мог обрезать альбом на границе истории — поэтому дочитываем
+    соседние сообщения. При ошибке сети — None (возьмём то, что уже есть).
+    """
     grouped_id = getattr(msg, "grouped_id", None)
     if not grouped_id:
         return [msg]
     msgs = []
-    async for m in client.iter_messages(peer, min_id=msg.id - 20, max_id=msg.id + 20):
-        if getattr(m, "grouped_id", None) == grouped_id:
-            msgs.append(m)
+    try:
+        async for m in client.iter_messages(peer, min_id=msg.id - 20, max_id=msg.id + 20):
+            if getattr(m, "grouped_id", None) == grouped_id:
+                msgs.append(m)
+    except Exception as e:
+        logger.warning(f"[tg] альбом не дочитан: {type(e).__name__}: {e}")
+        return None
     msgs.sort(key=lambda m: m.id)  # хронологический порядок, как в исходном посте
     return msgs or [msg]
 
