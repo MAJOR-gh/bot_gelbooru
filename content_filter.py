@@ -243,7 +243,7 @@ def post_is_allowed(post: dict, allowed_ratings: frozenset | None = None) -> boo
         n = _norm(tag)
         if _is_hard_variant(n):
             return False
-        if any(c in tag for c in CRITICAL_TAGS):
+        if any(c in tag or c in n for c in CRITICAL_TAGS):   # n: «aged-down» = «aged_down»
             return False
         if any(a in tag for a in AI_SUBSTRINGS):
             return False
@@ -307,7 +307,7 @@ def tag_is_blocked(tag: str) -> bool:
     # с «-collar» и молча возвращал пустоту.
     if low in BLACKLIST_SET or low in HARD_SET:
         return True
-    if any(c in low for c in CRITICAL_TAGS):
+    if any(c in low or c in n for c in CRITICAL_TAGS):
         return True
     if any(a in low for a in AI_SUBSTRINGS):
         return True

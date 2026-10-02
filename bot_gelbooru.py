@@ -36,7 +36,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger('gelbooru_bot')
 
-VERSION = "3.0"
+VERSION = "3.0.1"
 
 
 def env_any(*names: str) -> str | None:
@@ -114,10 +114,15 @@ NSFW_ONLY = "🔞 Пиздуй в NSFW канал!"
 
 
 def channel_allows_nsfw(interaction: nextcord.Interaction) -> bool:
-    """NSFW разрешён в личке и в NSFW-каналах (в ветке — по родительскому каналу)."""
+    """NSFW разрешён только в NSFW-каналах (в ветке — по родительскому каналу).
+
+    В личке — нет: там нет возрастной проверки канала (Discord пускает NSFW в ЛС
+    только для команд с пометкой age-restricted). nextcord и так отдаёт ЛС как
+    PartialMessageable без is_nsfw — здесь это просто сказано явно.
+    """
+    if interaction.guild_id is None:
+        return False
     channel = interaction.channel
-    if isinstance(channel, nextcord.DMChannel):
-        return True
     is_nsfw = getattr(channel, "is_nsfw", None)
     if callable(is_nsfw):
         try:
@@ -359,7 +364,7 @@ async def run_booru_search(interaction: nextcord.Interaction, raw_tags: tuple, s
                            cooldown: CooldownManager, *, nsfw: bool = True):
     """Общая логика /gelbooru, /konachan, /safebooru.
 
-    nsfw=True — только NSFW-каналы/личка и требование наготы (для Safebooru оба
+    nsfw=True — только NSFW-каналы и требование наготы (для Safebooru оба
     выключены; система блокировки тегов та же).
     """
     if nsfw and not channel_allows_nsfw(interaction):
@@ -684,7 +689,7 @@ async def help_command(interaction: nextcord.Interaction):
     embed.add_field(name="🏷️ /tags", value="Популярные теги и сколько по ним артов", inline=False)
     embed.add_field(name="🔍 /tagcheck <тег>", value="Проверить тег и подсказать похожие, если опечатка", inline=False)
     embed.add_field(name="📖 /help", value="Показать эту справку", inline=False)
-    embed.set_footer(text="💡 NSFW-команды работают только в NSFW-каналах или в ЛС. Тег с минусом (-tag) исключает его.")
+    embed.set_footer(text="💡 NSFW-команды работают только в NSFW-каналах. Тег с минусом (-tag) исключает его.")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
@@ -737,7 +742,8 @@ async def on_ready():
 
 @bot.event
 async def on_application_command_error(interaction: nextcord.Interaction, error: Exception):
-    logger.error(f"[command_error] {type(error).__name__}: {error}")
+    name = getattr(interaction.application_command, "name", "?")
+    logger.error(f"[command_error] /{name}: {type(error).__name__}: {error}", exc_info=error)
     try:
         if interaction.response.is_done():
             await interaction.followup.send("❌ Произошла ошибка при выполнении команды.", ephemeral=True)

@@ -78,6 +78,8 @@ check("HARD exact collar blocked (was silent empty result)", cf.tag_is_blocked("
 check("1boy blocked", cf.tag_is_blocked("1boy") is True)
 check("exclusion -futa is allowed", cf.tag_is_blocked("-futa") is False)
 check("loli substring blocked", cf.tag_is_blocked("loli_dominance") is True)
+check("hyphen age variant blocked (user tag)", cf.tag_is_blocked("aged-down") is True)
+check("hyphen age variant rejected (post)", cf.post_is_clean({"tags": "aged-down nude"}) is False)
 
 print("== clean_user_tags ==")
 check("spaces -> underscore + lower", cf.clean_user_tags(("Large  Breasts", None, " ")) == ["large_breasts"])
@@ -372,6 +374,28 @@ async def search_tests():
 
 
 asyncio.run(search_tests())
+
+print("== channel_allows_nsfw ==")
+
+
+class _Chan:
+    def __init__(self, nsfw):
+        self._nsfw = nsfw
+
+    def is_nsfw(self):
+        return self._nsfw
+
+
+class _ChanInter:
+    def __init__(self, guild_id, channel):
+        self.guild_id = guild_id
+        self.channel = channel
+
+
+check("NSFW channel allowed", b.channel_allows_nsfw(_ChanInter(1, _Chan(True))) is True)
+check("plain channel refused", b.channel_allows_nsfw(_ChanInter(1, _Chan(False))) is False)
+check("DM refused (no age gate)", b.channel_allows_nsfw(_ChanInter(None, _Chan(True))) is False)
+check("channel without is_nsfw refused", b.channel_allows_nsfw(_ChanInter(1, object())) is False)
 
 print(f"\n==== {passed} passed, {failed} failed ====")
 raise SystemExit(1 if failed else 0)
