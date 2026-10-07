@@ -156,6 +156,9 @@ class HistoryTests(unittest.TestCase):
 
 class AsyncTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
+        self.tmp_cache = tempfile.TemporaryDirectory()
+        self.env_patch = patch.dict(os.environ, {'DATA_DIR': self.tmp_cache.name})
+        self.env_patch.start()
         booru.clear_search_cache()
         self.old_memory = bot.memory
         bot.memory = sel.ShownMemory(':memory:')
@@ -166,6 +169,8 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
         bot.memory.close()
         bot.memory = self.old_memory
         booru.clear_search_cache()
+        self.env_patch.stop()
+        self.tmp_cache.cleanup()
 
     def pages(self, posts, count=True, cap=100):
         calls = []
@@ -177,7 +182,7 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
     async def test_all_3200_posts_searchable(self):
         fetch, calls = self.pages([post(i) for i in range(3200)])
         with patch('booru.fetch_page', fetch):
-            result = await booru.search(self.source, ['1girl'], set())
+            result = await booru.search(self.source, ['1girl'], set(), exhaustive=True)
         self.assertTrue(result.complete)
         self.assertEqual(result.fetched, 3200)
         self.assertEqual(len(result.candidates), 3200)
@@ -189,7 +194,7 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
         posts[-1]['tags'] = '1girl nude large_breasts'
         fetch, _ = self.pages(posts)
         with patch('booru.fetch_page', fetch):
-            result = await booru.search(self.source, ['large_breasts'], set())
+            result = await booru.search(self.source, ['large_breasts'], set(), exhaustive=True)
         self.assertEqual(result.candidates[0]['id'], 3199)
 
     async def test_650_images_then_exhaustion_no_502_cycle(self):
@@ -197,7 +202,7 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
         seen = set()
         with patch('booru.fetch_page', fetch):
             for i in range(700):
-                result = await booru.search(self.source, ['1girl'], bot.memory.recent(self.scope))
+                result = await booru.search(self.source, ['1girl'], bot.memory.recent(self.scope), exhaustive=True)
                 if i < 650:
                     uid = sel.post_uid(result.candidates[0])
                     self.assertNotIn(uid, seen)
@@ -210,7 +215,7 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
     async def test_unknown_total_until_empty_page(self):
         fetch, calls = self.pages([post(i) for i in range(3201)], count=False)
         with patch('booru.fetch_page', fetch):
-            result = await booru.search(self.source, ['1girl'], set())
+            result = await booru.search(self.source, ['1girl'], set(), exhaustive=True)
         self.assertEqual(len(result.candidates), 3201)
         self.assertIn(33, calls)
         self.assertTrue(result.complete)
@@ -218,7 +223,7 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
     async def test_server_caps_page_size(self):
         fetch, calls = self.pages([post(i) for i in range(301)], cap=50)
         with patch('booru.fetch_page', fetch):
-            result = await booru.search(self.source, ['1girl'], set())
+            result = await booru.search(self.source, ['1girl'], set(), exhaustive=True)
         self.assertEqual(len(result.candidates), 301)
         self.assertIn(6, calls)
 
@@ -226,7 +231,7 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
         posts = [dict(post(i), tags='ai_generated') for i in range(3200)]
         fetch, _ = self.pages(posts)
         with patch('booru.fetch_page', fetch):
-            result = await booru.search(self.source, ['1girl'], set())
+            result = await booru.search(self.source, ['1girl'], set(), exhaustive=True)
         self.assertEqual(result.fetched, 3200)
         self.assertEqual(result.allowed, 0)
         self.assertEqual(result.candidates, [])
@@ -240,12 +245,12 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
                 raise booru.SourceError('down')
             return posts[page * 100:(page + 1) * 100], 650
         with patch('booru.fetch_page', fetch):
-            result = await booru.search(self.source, ['1girl'], set())
+            result = await booru.search(self.source, ['1girl'], set(), exhaustive=True)
             self.assertEqual(result.candidates, [])
             self.assertEqual(result.errors, ['down'])
             self.assertFalse(result.complete)
             fail = False
-            result = await booru.search(self.source, ['1girl'], set())
+            result = await booru.search(self.source, ['1girl'], set(), exhaustive=True)
         self.assertEqual(len(result.candidates), 650)
         self.assertEqual(calls.count(0), 1)
         self.assertEqual(calls.count(1), 1)
@@ -258,13 +263,13 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.sleep(0.1)
             return posts[page * 100:(page + 1) * 100], 3200
         with patch('booru.fetch_page', fetch), patch('booru.SCAN_TIMEOUT', 0.01):
-            result = await booru.search(self.source, ['1girl'], set())
+            result = await booru.search(self.source, ['1girl'], set(), exhaustive=True)
             self.assertEqual(result.errors, ['scan_pending'])
             self.assertEqual(result.fetched, 100)
             self.assertEqual(result.candidates, [])
             slow = False
             with patch('booru.SCAN_TIMEOUT', 5):
-                result = await booru.search(self.source, ['1girl'], set())
+                result = await booru.search(self.source, ['1girl'], set(), exhaustive=True)
         self.assertTrue(result.complete)
         self.assertEqual(len(result.candidates), 3200)
 
@@ -272,7 +277,7 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
         async def fetch(source, tags, page):
             return [post(i) for i in range(100)], None
         with patch('booru.fetch_page', fetch):
-            result = await booru.search(self.source, ['1girl'], set())
+            result = await booru.search(self.source, ['1girl'], set(), exhaustive=True)
         self.assertEqual(result.errors, ['incomplete'])
         self.assertEqual(result.candidates, [])
 
@@ -280,34 +285,34 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
         async def fetch(source, tags, page):
             return ([post(i) for i in range(100)] if page == 0 else []), 650
         with patch('booru.fetch_page', fetch):
-            result = await booru.search(self.source, ['1girl'], set())
+            result = await booru.search(self.source, ['1girl'], set(), exhaustive=True)
         self.assertEqual(result.errors, ['incomplete'])
         self.assertFalse(result.complete)
 
     async def test_cache_reused_when_tags_reordered(self):
         fetch, calls = self.pages([post(i) for i in range(3200)])
         with patch('booru.fetch_page', fetch):
-            await booru.search(self.source, ['1girl', 'sky'], set())
+            await booru.search(self.source, ['1girl', 'sky'], set(), exhaustive=True)
             first = len(calls)
-            await booru.search(self.source, ['sky', '1girl'], set())
+            await booru.search(self.source, ['sky', '1girl'], set(), exhaustive=True)
         self.assertEqual(len(calls), first)
 
     async def test_expired_full_scan_refreshes(self):
         posts = [post(i) for i in range(101)]
         fetch, _ = self.pages(posts)
         with patch('booru.fetch_page', fetch):
-            await booru.search(self.source, ['1girl'], set())
+            await booru.search(self.source, ['1girl'], set(), exhaustive=True)
             state = next(iter(booru._scans.values()))
             state.updated -= booru.CACHE_TTL + 1
             posts.append(post(101))
-            result = await booru.search(self.source, ['1girl'], set())
+            result = await booru.search(self.source, ['1girl'], set(), exhaustive=True)
         self.assertEqual(len(result.candidates), 102)
 
     async def test_malformed_api_response_not_cached_as_empty(self):
         async def text(*args, **kwargs):
             return '<html><body>blocked</body></html>'
         with patch('booru.fetch_text', text):
-            result = await booru.search(self.source, ['1girl'], set())
+            result = await booru.search(self.source, ['1girl'], set(), exhaustive=True)
         self.assertEqual(result.errors, ['bad'])
         self.assertFalse(booru._cache)
 
@@ -442,18 +447,18 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
             return posts[page * 100:(page + 1) * 100], 650
         with patch('booru.fetch_page', fetch):
             first, second = await asyncio.gather(
-                booru.search(self.source, ['1girl'], set()),
-                booru.search(self.source, ['1girl'], {'image-0'}))
-        self.assertEqual(len(calls), 7)
+                booru.search(self.source, ['1girl'], set(), exhaustive=True),
+                booru.search(self.source, ['1girl'], {'image-0'}, exhaustive=True))
+        self.assertEqual(len(calls), 10)
         self.assertEqual(len(first.candidates), 650)
         self.assertEqual(len(second.candidates), 649)
 
     async def test_lazy_disk_index_survives_cache_eviction(self):
         fetch, _ = self.pages([post(i) for i in range(3200)])
         with patch('booru.fetch_page', fetch):
-            held = await booru.search(self.source, ['first'], set())
+            held = await booru.search(self.source, ['first'], set(), exhaustive=True)
             for i in range(booru.SCAN_CACHE_MAX + 1):
-                await booru.search(self.source, [str(i)], set())
+                await booru.search(self.source, [str(i)], set(), exhaustive=True)
         self.assertNotIsInstance(held.candidates, list)
         self.assertEqual(held.candidates[-1]['id'], 3199)
         self.assertLessEqual(len(booru._scans), booru.SCAN_CACHE_MAX)
@@ -475,7 +480,7 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
         expected = sel.order_candidates(strict, seen, groups, broad)
         fetch, _ = self.pages(posts)
         with patch('booru.fetch_page', fetch):
-            result = await booru.search(self.source, ['breasts'], seen)
+            result = await booru.search(self.source, ['breasts'], seen, exhaustive=True)
         self.assertEqual([p['id'] for p in result.candidates], [p['id'] for p in expected])
 
     async def test_http_5xx_preserves_ambiguous_delivery(self):
@@ -511,9 +516,171 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
             async def text(*args, **kwargs):
                 return body
             with patch('booru.fetch_text', text):
-                result = await booru.search(self.source, ['1girl'], set())
+                result = await booru.search(self.source, ['1girl'], set(), exhaustive=True)
             self.assertEqual(result.errors, ['bad'])
             self.assertFalse(booru._cache)
+
+    async def test_huge_query_returns_first_page_without_full_scan(self):
+        calls = []
+        async def fetch(source, tags, page):
+            calls.append(page)
+            self.assertEqual(page, 0, 'must not pre-index 444972 posts')
+            return [post(i) for i in range(100)], 444972
+        with patch('booru.fetch_page', fetch):
+            result = await booru.search(self.source, ['1girl'], set())
+        self.assertTrue(result.candidates)
+        self.assertFalse(result.complete)
+        self.assertEqual(result.errors, [])
+        self.assertEqual(calls, [0])
+
+    async def test_progressive_650_unique_then_no_replays(self):
+        fetch, calls = self.pages([post(i) for i in range(650)])
+        seen = set()
+        with patch('booru.fetch_page', fetch):
+            for i in range(700):
+                result = await booru.search(self.source, ['1girl'], seen)
+                if i < 650:
+                    self.assertTrue(result.candidates)
+                    uid = sel.post_uid(result.candidates[0])
+                    self.assertNotIn(uid, seen)
+                    seen.add(uid)
+                else:
+                    self.assertFalse(result.candidates)
+        self.assertEqual(len(seen), 650)
+        self.assertIn(6, calls)
+
+    async def test_partial_budget_resumes_after_restart(self):
+        fetch, calls = self.pages([post(i) for i in range(3200)])
+        with patch('booru.fetch_page', fetch), patch('booru.PAGES_PER_REQUEST', 1):
+            result = await booru.search(self.source, ['1girl'], set())
+            result = await booru.search(self.source, ['1girl'], {f'image-{i}' for i in range(100)})
+            self.assertEqual(result.fetched, 200)
+            result = None
+            booru.clear_search_cache()  # new state/connection, disk cursor survives
+            result = await booru.search(self.source, ['1girl'], {f'image-{i}' for i in range(200)})
+        self.assertEqual(calls, [0, 1, 2])
+        self.assertEqual(result.candidates[0]['id'], 200)
+
+    async def test_filtered_pages_continue_beyond_600(self):
+        posts = [dict(post(i), tags='ai_generated') for i in range(3200)]
+        posts[-1] = post(3199)
+        fetch, calls = self.pages(posts)
+        with patch('booru.fetch_page', fetch):
+            for _ in range(6):
+                result = await booru.search(self.source, ['1girl'], set())
+                if result.candidates:
+                    break
+        self.assertTrue(result.candidates)
+        self.assertEqual(result.candidates[0]['id'], 3199)
+        self.assertIn(31, calls)
+        self.assertGreater(result.fetched, 600)
+
+    async def test_unseen_indexed_posts_survive_later_api_error(self):
+        async def fetch(source, tags, page):
+            if page == 0:
+                return [post(1), post(2)], 444972
+            raise booru.SourceError('bad', 'temporary invalid response')
+        with patch('booru.fetch_page', fetch):
+            result = await booru.search(self.source, ['1girl'], set())
+        self.assertEqual(result.errors, [])
+        self.assertEqual([p['id'] for p in result.candidates], [1, 2])
+
+    async def test_api_error_never_returns_seen_cached_posts(self):
+        async def fetch(source, tags, page):
+            if page == 0:
+                return [post(1), post(2)], 444972
+            raise booru.SourceError('down', 'late page unavailable')
+        with patch('booru.fetch_page', fetch):
+            result = await booru.search(self.source, ['1girl'], {'image-1', 'image-2'})
+        self.assertFalse(result.candidates)
+        self.assertEqual(result.errors, ['down'])
+
+    async def test_empty_gelbooru_page_with_positive_count_valid(self):
+        self.assertEqual(booru.parse_posts_page('{"@attributes":{"count":444972}}'), ([], 444972))
+        async def text(url, params, **kwargs):
+            if params.get('pid') == '0':
+                return json.dumps({'@attributes': {'count': 444972}, 'post': [post(1)]})
+            return '{"@attributes":{"count":444972}}'
+        with patch('booru.fetch_text', text):
+            result = await booru.search(self.source, ['1girl'], set())
+        self.assertEqual(result.errors, [])
+        self.assertEqual(result.candidates[0]['id'], 1)
+        self.assertEqual(result.stop_reason, 'api_end_before_count')
+
+    async def test_count_underestimate_does_not_cut_search(self):
+        posts = [post(i) for i in range(3200)]
+        async def fetch(source, tags, page):
+            return posts[page * 100:(page + 1) * 100], 150
+        with patch('booru.fetch_page', fetch):
+            result = await booru.search(self.source, ['1girl'], set(), exhaustive=True)
+        self.assertEqual(len(result.candidates), 3200)
+        self.assertTrue(result.complete)
+
+    async def test_timeout_keeps_genuinely_new_candidates(self):
+        async def fetch(source, tags, page):
+            if page == 0:
+                return [post(1)], 444972
+            await asyncio.sleep(1)
+        with patch('booru.fetch_page', fetch), patch('booru.SCAN_TIMEOUT', 0.02):
+            result = await booru.search(self.source, ['1girl'], set())
+        self.assertEqual(result.errors, [])
+        self.assertEqual(result.candidates[0]['id'], 1)
+
+    async def test_partial_progress_does_not_expire_after_ten_minutes(self):
+        fetch, calls = self.pages([post(i) for i in range(3200)])
+        with patch('booru.fetch_page', fetch), patch('booru.PAGES_PER_REQUEST', 1):
+            await booru.search(self.source, ['1girl'], set())
+            state = next(iter(booru._scans.values()))
+            state.updated -= booru.CACHE_TTL + 1
+            result = await booru.search(self.source, ['1girl'], {f'image-{i}' for i in range(100)})
+        self.assertEqual(calls, [0, 1])
+        self.assertEqual(result.candidates[0]['id'], 100)
+
+    async def test_failed_page_cursor_not_skipped_in_default_mode(self):
+        fail = True
+        async def fetch(source, tags, page):
+            if fail and page == 1:
+                raise booru.SourceError('down', 'retry this page')
+            return [post(page * 100 + i) for i in range(100)], 444972
+        with patch('booru.fetch_page', fetch):
+            result = await booru.search(self.source, ['1girl'], {f'image-{i}' for i in range(100)})
+            self.assertEqual(result.errors, ['down'])
+            self.assertEqual(next(iter(booru._scans.values())).next_page, 1)
+            fail = False
+            result = await booru.search(self.source, ['1girl'], {f'image-{i}' for i in range(100)})
+        self.assertEqual(result.candidates[0]['id'], 100)
+
+    async def test_auth_error_still_explicit_with_partial_index(self):
+        async def fetch(source, tags, page):
+            if page == 0:
+                return [post(1)], 444972
+            raise booru.SourceError('auth', 'HTTP 401')
+        with patch('booru.fetch_page', fetch):
+            result = await booru.search(self.source, ['1girl'], set())
+        self.assertFalse(result.candidates)
+        self.assertEqual(result.errors, ['auth'])
+
+    async def test_discord_handler_sends_first_art_before_full_index(self):
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock
+        interaction = Interaction()
+        interaction.user = SimpleNamespace(id=1)
+        interaction.guild = None
+        interaction.channel = SimpleNamespace(is_nsfw=lambda: True)
+        interaction.response = SimpleNamespace(defer=AsyncMock(), send_message=AsyncMock())
+        calls = []
+        async def fetch(source, tags, page):
+            calls.append(page)
+            self.assertEqual(page, 0)
+            return [post(i) for i in range(100)], 444972
+        async def make(source, p, display, max_size):
+            return {'content': 'new-art-' + str(p['id'])}, ''
+        with patch('booru.fetch_page', fetch), patch('bot_gelbooru.build_booru_payload', make):
+            await bot.run_booru_search(interaction, ('1girl',), self.source, bot.CooldownManager(5, 30))
+        interaction.response.defer.assert_awaited_once()
+        self.assertEqual(calls, [0])
+        self.assertEqual(interaction.followup.sent, [{'content': 'new-art-0'}])
+        self.assertIn('image-0', bot.memory.recent(self.scope))
 
 
 if __name__ == '__main__':

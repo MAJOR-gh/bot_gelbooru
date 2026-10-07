@@ -12,3 +12,5 @@ data/
 # SQLite history and disposable search indexes (never ship runtime data)
 shown.sqlite3*
 .search-index-*
+
+search_cache/

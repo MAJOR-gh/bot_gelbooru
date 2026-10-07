@@ -1,8 +1,8 @@
 """Booru-источники (Gelbooru, Konachan, Safebooru): HTTP, разбор ответов, поиск.
 
-Обходим всю доступную API выдачу, затем фильтруем и ранжируем её.
-Полный результат кэшируется на 10 минут. Долгий обход возобновляется,
-а ошибки API никогда не подменяются возвратом ранее показанного.
+Возвращаем лучшие новые результаты из просмотренной части, затем постепенно
+обходим следующие страницы без общего потолка. Индекс и курсор переживают
+перезапуск. Ошибки API никогда не подменяются возвратом показанного.
 """
 import asyncio
 import json
@@ -117,7 +117,7 @@ def parse_posts_page(text: str) -> tuple[list[dict] | None, int | None]:
     else:
         if isinstance(data, dict):
             count = _to_int((data.get("@attributes") or {}).get("count"))
-            if "post" not in data and count != 0:
+            if "post" not in data and count is None:
                 return None, count
             post = data.get("post", [])
             if isinstance(post, dict):           # один пост приходит словарём
@@ -305,9 +305,14 @@ async def fetch_page(source: Source, tags: list[str], page: int) -> tuple[list[d
 # Нет потолка страниц/постов. Временной бюджет ограничивает ОДИН вызов,
 # а не область поиска: незавершённый обход продолжается следующим запросом.
 SCAN_CONCURRENCY = 3
-SCAN_TIMEOUT = float(os.environ.get("SEARCH_TIMEOUT_SECONDS", "120"))
-if not 0 < SCAN_TIMEOUT <= 600:
-    raise ValueError("SEARCH_TIMEOUT_SECONDS должен быть числом от 0 (не включая) до 600")
+_requested_timeout = float(os.environ.get("SEARCH_TIMEOUT_SECONDS", "20"))
+if not 0 < _requested_timeout <= 600:
+    raise ValueError("SEARCH_TIMEOUT_SECONDS должен быть положительным числом до 600")
+SCAN_TIMEOUT = min(_requested_timeout, 30.0)  # old env=120 must not restore long waits
+PAGES_PER_REQUEST = 6  # per invocation, NOT a maximum search depth
+NEED_FRESH = 5
+with open(cf.__file__, "rb") as _policy_file:
+    POLICY_HASH = hashlib.sha256(_policy_file.read()).hexdigest()
 SCAN_CACHE_MAX = 4
 
 
@@ -319,20 +324,39 @@ class SearchResult:
     total: int | None = None
     complete: bool = False
     allowed: int = 0
+    stop_reason: str | None = None
 
 
 @dataclass
 class ScanState:
     index: SearchIndex = field(default_factory=SearchIndex)
     allowed: int = 0
-    signatures: set[str] = field(default_factory=set)
     next_page: int = 0
     page_size: int = 100
     total: int | None = None
     fetched: int = 0
     complete: bool = False
     updated: float = field(default_factory=time.monotonic)
+    stop_reason: str | None = None
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+    def save(self, page=None, signature=None):
+        self.updated = time.monotonic()
+        self.index.save_progress({"next_page": self.next_page, "page_size": self.page_size,
+                                  "total": self.total, "fetched": self.fetched,
+                                  "complete": self.complete, "stop_reason": self.stop_reason,
+                                  "saved_at": time.time()}, page, signature)
+
+    @classmethod
+    def restore(cls, key, page_size):
+        index = SearchIndex(cache_key=key)
+        saved = index.progress()
+        state = cls(index=index, page_size=page_size, allowed=index.allowed_count())
+        for field_name in ('next_page', 'page_size', 'total', 'fetched', 'complete', 'stop_reason'):
+            if field_name in saved:
+                setattr(state, field_name, saved[field_name])
+        state.updated -= max(0, time.time() - saved.get('saved_at', time.time()))
+        return state
 
 
 _scans: "OrderedDict[tuple, ScanState]" = OrderedDict()
@@ -344,97 +368,116 @@ def clear_search_cache() -> None:
 
 
 async def _scan_all(source: Source, tags: list[str], state: ScanState,
-                    require_nudity: bool) -> None:
+                    require_nudity: bool, recent=(), exhaustive=False) -> None:
     groups = cf.focus_groups_for(tags)
     nudity = cf.requested_nudity_tags(groups)
     async with state.lock:
+        read = 0
         while not state.complete:
-            if state.next_page == 0:
-                pages = [0]
-            elif state.total is not None:
-                page_count = (state.total + state.page_size - 1) // state.page_size
-                if state.next_page >= page_count:
-                    if state.fetched < state.total:
-                        raise SourceError("incomplete", "API вернул меньше постов, чем count")
-                    state.complete = True
-                    break
-                pages = list(range(state.next_page,
-                                   min(page_count, state.next_page + SCAN_CONCURRENCY)))
-            else:
-                pages = list(range(state.next_page, state.next_page + SCAN_CONCURRENCY))
+            if not exhaustive:
+                candidates = state.index.candidates(recent)
+                first = candidates[:NEED_FRESH]
+                if len(first) >= NEED_FRESH and (not require_nudity or all(
+                        cf.has_nudity(p, nudity) for p in first)):
+                    return
+                if read >= PAGES_PER_REQUEST:
+                    return
+            remaining = SCAN_CONCURRENCY if exhaustive else min(SCAN_CONCURRENCY, PAGES_PER_REQUEST - read)
+            pages = [0] if state.next_page == 0 else list(range(state.next_page, state.next_page + remaining))
             results = await asyncio.gather(*(fetch_page(source, tags, n) for n in pages),
                                            return_exceptions=True)
-            # Consume in page order. If a page fails, the cursor does NOT skip it.
-            # Other successful pages remain cached for the next attempt.
             for page, result in zip(pages, results):
                 if isinstance(result, BaseException):
                     if isinstance(result, asyncio.CancelledError):
                         raise result
-                    if isinstance(result, SourceError):
-                        raise result
-                    logger.error("[%s] страница %s: %s", source.name, page, type(result).__name__)
-                    raise SourceError("down", "Не удалось прочитать страницу")
+                    error = result if isinstance(result, SourceError) else SourceError('down', type(result).__name__)
+                    logger.warning('[%s] page=%s next_page=%s fetched=%s total_hint=%s: %s',
+                                   source.name, page, state.next_page, state.fetched, state.total, error)
+                    raise error
                 posts, count = result
                 if page == 0:
                     state.total = count if count is not None and count >= 0 else None
-                    state.page_size = source.page_size
                     if posts and state.total is not None and state.total > len(posts):
-                        # Some APIs cap the requested limit. Follow actual offsets.
                         state.page_size = min(source.page_size, len(posts))
                 if not posts:
-                    if state.total is not None and state.fetched < state.total:
-                        raise SourceError("incomplete", "Пустая страница до заявленного конца")
+                    # count is only a hint. Empty pages are a valid API response.
                     state.complete = True
-                    break
-                ids = sorted(str(p.get("id") or post_uid(p)) for p in posts)
+                    state.stop_reason = ('api_end_before_count' if state.total is not None
+                                         and state.fetched < state.total else 'api_end')
+                    state.save()
+                    logger.info('[%s] pagination ended: page=%s fetched=%s total_hint=%s reason=%s',
+                                source.name, page, state.fetched, state.total, state.stop_reason)
+                    return
+                ids = sorted(str(p.get('id') or post_uid(p)) for p in posts)
                 signature = hashlib.sha256("\0".join(ids).encode()).hexdigest()
-                if signature in state.signatures:
-                    raise SourceError("incomplete", "API повторяет страницу вместо пагинации")
+                if state.index.repeated_page(page, signature):
+                    state.complete = True
+                    state.stop_reason = 'repeated_page'
+                    state.save()
+                    logger.warning('[%s] API repeats page %s; cached NEW candidates remain usable', source.name, page)
+                    return
                 records = []
                 for offset, post in enumerate(posts):
-                    site_id = f"{post.get('_site')}:{post['id']}" if post.get('id') is not None else ""
+                    site_id = f"{post.get('_site')}:{post['id']}" if post.get('id') is not None else ''
                     allowed = int(cf.post_is_allowed(post, source.ratings))
                     strict = int(not require_nudity or cf.has_nudity(post, nudity))
                     records.append((post_uid(post), site_id, json.dumps(post), allowed, strict,
                                     cf.focus_tier(post, groups), post_score(post), state.fetched + offset))
                 state.allowed += state.index.add(records)
-                state.signatures.add(signature)
                 state.fetched += len(posts)
                 state.next_page = page + 1
-                state.updated = time.monotonic()
-        state.updated = time.monotonic()
+                state.save(page, signature)
+                read += 1
+
 
 
 async def search(source: Source, tags: list[str], recent, *,
-                 require_nudity: bool = True) -> SearchResult:
-    """Ранжирует ВСЮ доступную выдачу; ошибки/таймаут не разрешают повторы.
+                 require_nudity: bool = True, exhaustive: bool = False) -> SearchResult:
+    """Fast response from NEW indexed posts, progressively traversing the API.
 
-    При отсутствии count идём до пустой страницы, а не до произвольного лимита.
-    API должен реально поддерживать пагинацию: ограничение сервиса не обходим.
+    No global page ceiling. No need to index 445k posts before returning one art.
+    exhaustive is a diagnostic/test option, not used by Discord commands.
     """
-    key = (source.name, tuple(sorted(tags)), require_nudity)
+    key = ('3.2', POLICY_HASH, source.name, tuple(sorted(tags)), require_nudity)
     state = _scans.get(key)
-    if state is None or (not state.lock.locked()
-                         and time.monotonic() - state.updated >= CACHE_TTL):
-        state = ScanState(page_size=source.page_size)
+    if state is None:
+        state = ScanState.restore(key, source.page_size)
         _scans[key] = state
+    if state.complete and not state.lock.locked() and time.monotonic() - state.updated >= CACHE_TTL:
+        state.index.reset_progress()
+        state.next_page, state.fetched, state.total = 0, 0, None
+        state.complete, state.stop_reason = False, None
+        state.save()
     _scans.move_to_end(key)
-    # Bound number of cached queries, NOT depth of a query. Active scans survive.
     for old_key in list(_scans):
         if len(_scans) <= SCAN_CACHE_MAX:
             break
         if old_key != key and not _scans[old_key].lock.locked():
             del _scans[old_key]
+    errors = []
     try:
         async with asyncio.timeout(SCAN_TIMEOUT):
-            await _scan_all(source, tags, state, require_nudity)
+            await _scan_all(source, tags, state, require_nudity, recent, exhaustive)
     except TimeoutError:
-        state.updated = time.monotonic()
-        return SearchResult([], ["scan_pending"], state.fetched, state.total)
+        errors = ['scan_pending']
     except SourceError as error:
-        return SearchResult([], [error.kind], state.fetched, state.total)
-    return SearchResult(state.index.candidates(recent), fetched=state.fetched,
-                        total=state.total, complete=True, allowed=state.allowed)
+        errors = [error.kind]
+    candidates = state.index.candidates(recent)
+    if exhaustive and state.stop_reason in {'api_end_before_count', 'repeated_page'}:
+        errors = ['incomplete']
+    # Network/count failures must not suppress already indexed, genuinely NEW art.
+    # This is NEVER a replay fallback. Auth/rate denials still return explicitly.
+    if candidates and not exhaustive and not set(errors) & {'auth', 'rate'}:
+        errors = []
+    elif exhaustive and errors:
+        candidates = []
+    elif errors:
+        candidates = []
+    if not candidates and not errors and not state.complete:
+        errors = ['scan_pending']
+    return SearchResult(candidates, errors, state.fetched, state.total,
+                        state.complete and state.stop_reason == 'api_end',
+                        state.allowed, state.stop_reason)
 
 
 # ── Скачивание медиа ──────────────────────────────────────────────────────────

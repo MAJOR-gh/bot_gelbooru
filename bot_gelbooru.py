@@ -38,7 +38,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger('gelbooru_bot')
 
-VERSION = "3.1.0"
+VERSION = "3.2.0"
 
 
 def env_any(*names: str) -> str | None:
@@ -452,13 +452,17 @@ async def run_booru_search(interaction: nextcord.Interaction, raw_tags: tuple, s
         if res.errors:
             if "scan_pending" in res.errors:
                 total = f" из примерно {res.total:,}" if res.total is not None else ""
-                text = (f"⏳ Полный поиск ещё не завершён: просмотрено {res.fetched:,}{total} постов. "
-                        "Повтори запрос — продолжу с сохранённой страницы. Старые арты не отправляю.")
+                text = (f"⏳ Пока не найдено новых подходящих артов: просмотрено {res.fetched:,}{total} постов. "
+                        "Повтори запрос — продолжу со следующей страницы. Повторы запрещены.")
             else:
                 text = source_error_text(source.name, res.errors)
             return await interaction.followup.send(text)
         if not res.candidates:
-            if res.allowed:
+            if res.stop_reason in {"api_end_before_count", "repeated_page"}:
+                text = (f"⚠️ {source.name} завершил или повторяет доступную пагинацию: "
+                        f"просмотрено {res.fetched:,} постов. Новых подходящих в этой части нет. "
+                        "Сузь теги или попробуй позже; повторы запрещены.")
+            elif res.allowed:
                 text = ("✅ Новых доступных артов для этого канала по запросу не осталось "
                         "(история показов/резервы/временные ошибки файлов). Повтор запрещён.")
             else:

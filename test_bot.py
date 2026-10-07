@@ -15,6 +15,8 @@ import selection as sel
 
 # Never touch the production history during tests.
 b.memory = sel.ShownMemory(":memory:")
+_test_cache = tempfile.TemporaryDirectory()
+os.environ['DATA_DIR'] = _test_cache.name
 
 passed = 0
 failed = 0
@@ -225,6 +227,7 @@ def fake_pages(pages: dict, count=None):
     """pages: {(tuple(tags), page): [posts]} → подмена booru.fetch_page + журнал вызовов."""
     calls = []
     booru.clear_search_cache()
+    FakeSource.name = 'Fake-' + str(time.monotonic_ns())
 
     async def fetch(source, tags, page):
         calls.append((tuple(tags), page))
@@ -261,8 +264,8 @@ async def search_tests():
 
         booru.fetch_page, calls = fake_pages(pages, count=6)
         r = await booru.search(FakeSource(), ["t"], deque(["n0", "n1", "n2", "n3"]))
-        check("count limits pages (count=6 -> pages 0,1)",
-              sorted(c[1] for c in calls if c[0] == ("t",)) == [0, 1])
+        check("count is advisory, later pages still searchable",
+              (("t",), 2) in calls and (("t",), 3) in calls)
 
         print("== search: nude phase & dressed fallback ==")
         pages2 = {(("t",), 0): [dressed_post(i) for i in range(3)] + [nude(1)],
@@ -293,6 +296,7 @@ async def search_tests():
         async def broken(source, tags, page):
             raise booru.SourceError("auth", "401")
         booru.clear_search_cache()
+        FakeSource.name = 'Broken-' + str(time.monotonic_ns())
         booru.fetch_page = broken
         r = await booru.search(FakeSource(), ["t"], deque())
         check("source error reported, no candidates", r.errors == ["auth"] and not r.candidates and r.fetched == 0)
@@ -399,5 +403,7 @@ check("DM refused (no age gate)", b.channel_allows_nsfw(_ChanInter(None, _Chan(T
 check("channel without is_nsfw refused", b.channel_allows_nsfw(_ChanInter(1, object())) is False)
 
 b.memory.close()
+booru.clear_search_cache()
+_test_cache.cleanup()
 print(f"\n==== {passed} passed, {failed} failed ====")
 raise SystemExit(1 if failed else 0)
