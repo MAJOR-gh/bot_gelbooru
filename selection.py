@@ -1,145 +1,212 @@
-"""Выбор арта: память показанного (анти-повтор) и порядок кандидатов.
+"""Строгий анти-повтор: ранжирование и долговечная история в SQLite.
 
-Принцип (как в Lawliet): показываем ЛУЧШИЙ ещё не показанный арт.
-Порядок важности: раздетый > одетый, фокус на запрошенной части тела, score.
-Когда по запросу показано всё — сначала то, что показывали давнее всего.
+Область истории — Discord-канал, а не запрос. Старые записи не вытесняются.
+Резервирование перед отправкой атомарно; при неясном исходе отправки резерв
+остаётся, чтобы повторный запрос не отправил потенциально доставленный файл.
 """
-import asyncio
 import json
 import logging
 import os
-from collections import deque
+import sqlite3
+import time
+import uuid
+from collections.abc import Iterable
 
 from content_filter import focus_tier
 
-logger = logging.getLogger("gelbooru_bot.selection")
-
-RECENT_MAX = 500        # сколько последних артов помним на каждый запрос
-RECENT_MAX_KEYS = 500   # сколько разных запросов держим (старые вытесняются)
+logger = logging.getLogger('gelbooru_bot.selection')
+LEGACY_SCOPE = '__legacy_all_channels__'
 
 
 def post_score(post: dict) -> int:
     try:
-        return int(post.get("score") or 0)
+        return int(post.get('score') or 0)
     except (TypeError, ValueError):
         return 0
 
 
 def post_uid(post: dict) -> str:
-    """Стабильный id арта: общий _uid (альбом TG), иначе md5, иначе сайт+id."""
-    uid = post.get("_uid")
+    uid = post.get('_uid')
     if uid:
-        return uid
-    md5 = (post.get("md5") or "").lower()
+        return str(uid)
+    md5 = str(post.get('md5') or '').lower()
     return md5 or f"{post.get('_site')}:{post.get('id')}"
 
 
-def recent_key(label: str, tags: list[str]) -> str:
-    """Ключ памяти: источник + набор тегов (порядок тегов не важен)."""
-    return label + "|" + ",".join(sorted(tags))
+def post_uids(post: dict) -> set[str]:
+    """MD5 + id источника: смена метаданных не делает тот же пост новым."""
+    ids = {post_uid(post)}
+    if post.get('_legacy_uid'):
+        ids.add(str(post['_legacy_uid']))
+    if post.get('_site') and post.get('id') is not None:
+        ids.add(f"{post['_site']}:{post['id']}")
+    return ids
 
 
-def order_candidates(strict: list[dict], recent, groups: set[str] | None = None,
+def channel_scope(interaction) -> str:
+    channel_id = getattr(interaction, 'channel_id', None)
+    if channel_id is None:
+        channel_id = getattr(getattr(interaction, 'channel', None), 'id', None)
+    if channel_id is None:
+        raise ValueError('Нет Discord channel_id: отправка без области истории запрещена')
+    return f"discord:{getattr(interaction, 'guild_id', None) or 'dm'}:{channel_id}"
+
+
+def order_candidates(strict: list[dict], recent: Iterable[str],
+                     groups: set[str] | None = None,
                      broad: list[dict] = ()) -> list[dict]:
-    """Финальный порядок кандидатов к показу.
-
-    strict — посты, прошедшие строгий фильтр (с наготой), broad — чистые, но
-    одетые (запасной вариант). Свежие (не из recent) идут первыми: сначала все
-    strict, потом broad, внутри — по фокусу и score. Если свежих нет —
-    давно показанные раньше недавних, чтобы не повторять только что отправленное.
-    """
+    """Только непоказанные. Исчерпание выдачи НИКОГДА не разрешает повтор."""
     seen = set(recent)
+    added: set[str] = set()
 
-    def rank(p: dict) -> tuple[int, int]:
-        return focus_tier(p, groups), post_score(p)
+    def fresh(posts):
+        result = []
+        for post in sorted(posts, key=lambda p: (focus_tier(p, groups), post_score(p)),
+                           reverse=True):
+            ids = post_uids(post)
+            if ids.isdisjoint(seen) and ids.isdisjoint(added):
+                result.append(post)
+                added.update(ids)
+        return result
 
-    def fresh(posts) -> list[dict]:
-        return sorted((p for p in posts if post_uid(p) not in seen), key=rank, reverse=True)
-
-    out = fresh(strict) + fresh(broad)
-    if out:
-        return out
-    age = {uid: i for i, uid in enumerate(recent)}   # меньше = показывали давнее
-    strict_ids = {id(p) for p in strict}
-    pool = list(strict) + list(broad)
-    return sorted(pool, key=lambda p: (age.get(post_uid(p), -1),
-                                       id(p) not in strict_ids,
-                                       -post_score(p)))
+    return fresh(strict) + fresh(broad)
 
 
 class ShownMemory:
-    """Что уже показывали по каждому запросу. Переживает рестарт (JSON на диске).
+    """Долговечный журнал sent/pending; SQLite — единственный источник истины.
 
-    Запись на диск — отложенная (раз в autosave-интервал и при выключении), а не
-    на каждый показ: файл бывает в мегабайты, синхронная запись тормозила бота.
+    Короткие транзакции не пересекают await. WAL + synchronous=FULL сохраняют
+    резерв ДО отправки. После crash pending не снимается автоматически: это
+    намеренный fail-closed режим (лучше пропуск, чем дубль).
     """
 
-    def __init__(self, path: str):
+    def __init__(self, path: str, legacy_path: str | None = None):
         self.path = path
-        self._data: dict[str, deque] = {}
-        self._dirty = False
+        self.legacy_path = legacy_path
+        self._db: sqlite3.Connection | None = None
 
     def load(self) -> None:
+        self._connection()
+
+    def _connection(self) -> sqlite3.Connection:
+        if self._db is not None:
+            return self._db
+        if self.path != ':memory:':
+            os.makedirs(os.path.dirname(self.path) or '.', exist_ok=True)
+        db = sqlite3.connect(self.path, timeout=5)
         try:
-            with open(self.path, encoding="utf-8") as f:
-                data = json.load(f)
-        except FileNotFoundError:
-            return
-        except (json.JSONDecodeError, OSError) as e:
-            logger.warning(f"Память показанных артов не прочитана ({e}) — начинаю с нуля")
-            return
-        if not isinstance(data, dict):
-            return
-        for key, uids in data.items():
-            if isinstance(uids, list):
-                self._data[key] = deque((str(u) for u in uids[-RECENT_MAX:]), maxlen=RECENT_MAX)
-        self._trim()
-        logger.info(f"🗂 Память показанных артов загружена: {len(self._data)} запросов")
+            db.execute('PRAGMA journal_mode=WAL')
+            db.execute('PRAGMA synchronous=FULL')
+            db.executescript('''
+                CREATE TABLE IF NOT EXISTS shown (
+                    scope TEXT NOT NULL, uid TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK(status IN ('pending','sent','blocked')),
+                    token TEXT, created REAL NOT NULL,
+                    PRIMARY KEY(scope,uid)
+                );
+                CREATE INDEX IF NOT EXISTS shown_token ON shown(token);
+                CREATE TABLE IF NOT EXISTS failed (
+                    scope TEXT NOT NULL, uid TEXT NOT NULL, retry_at REAL NOT NULL,
+                    PRIMARY KEY(scope,uid)
+                );
+                CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT);
+            ''')
+            if self.legacy_path and not db.execute(
+                    "SELECT 1 FROM metadata WHERE key='legacy_imported'").fetchone():
+                # No channel information exists in the old JSON. Conservatively
+                # block its known IDs in every channel; NEVER silently drop history.
+                if os.path.exists(self.legacy_path):
+                    with open(self.legacy_path, encoding='utf-8') as f:
+                        data = json.load(f)
+                    if not isinstance(data, dict) or any(not isinstance(v, list) for v in data.values()):
+                        raise ValueError('Повреждена старая история; автоматический сброс запрещён')
+                    uids = {str(uid) for values in data.values() for uid in values}
+                    with db:
+                        db.executemany('INSERT OR IGNORE INTO shown VALUES (?,?,\'sent\',NULL,?)',
+                                       [(LEGACY_SCOPE, uid, time.time()) for uid in uids])
+                        db.execute("INSERT INTO metadata VALUES ('legacy_imported','1')")
+                    logger.info('Импортировано %s ID из старой истории (общий запрет)', len(uids))
+        except BaseException:
+            db.close()
+            raise
+        self._db = db
+        return db
 
-    def recent(self, key: str) -> deque:
-        return self._data.get(key) or deque()
+    def recent(self, scope: str) -> set[str]:
+        db = self._connection()
+        return {row[0] for row in db.execute('''
+            SELECT uid FROM shown WHERE scope IN (?,?)
+            UNION SELECT uid FROM failed WHERE scope=? AND retry_at>?
+        ''', (scope, LEGACY_SCOPE, scope, time.time()))}
 
-    def remember(self, key: str, uid: str) -> None:
-        dq = self._data.pop(key, None) or deque(maxlen=RECENT_MAX)
-        if uid in dq:          # повтор при исчерпании — переносим в «свежие»
-            dq.remove(uid)
-        dq.append(uid)
-        self._data[key] = dq   # в конец словаря = недавно использованный (LRU)
-        self._trim()
-        self._dirty = True
+    def _claim(self, scope: str, uids: Iterable[str], token: str) -> bool:
+        ids = sorted(set(uids))
+        if not ids:
+            raise ValueError('Нельзя зарезервировать арт без идентификатора')
+        db = self._connection()
+        db.execute('BEGIN IMMEDIATE')
+        try:
+            for uid in ids:
+                if db.execute('''SELECT 1 FROM shown WHERE uid=? AND scope IN (?,?)
+                                 AND (token IS NULL OR token!=?) LIMIT 1''',
+                              (uid, scope, LEGACY_SCOPE, token)).fetchone():
+                    db.rollback()
+                    return False
+                if db.execute('SELECT 1 FROM failed WHERE scope=? AND uid=? AND retry_at>?',
+                              (scope, uid, time.time())).fetchone():
+                    db.rollback()
+                    return False
+            db.executemany("INSERT OR IGNORE INTO shown VALUES (?,?,'pending',?,?)",
+                           [(scope, uid, token, time.time()) for uid in ids])
+            db.commit()
+            return True
+        except BaseException:
+            db.rollback()
+            raise
 
-    def _trim(self) -> None:
-        while len(self._data) > RECENT_MAX_KEYS:
-            self._data.pop(next(iter(self._data)))
+    def reserve(self, scope: str, uids: Iterable[str]) -> str | None:
+        token = uuid.uuid4().hex
+        return token if self._claim(scope, uids, token) else None
+
+    def extend(self, scope: str, token: str, uids: Iterable[str]) -> bool:
+        return self._claim(scope, uids, token)
+
+    def mark_sent(self, token: str) -> None:
+        db = self._connection()
+        with db:
+            db.execute("UPDATE shown SET status='sent',token=NULL WHERE token=?", (token,))
+
+    def mark_blocked(self, token: str) -> None:
+        # Different post IDs may refer to bytes already sent/reserved elsewhere.
+        db = self._connection()
+        with db:
+            db.execute("UPDATE shown SET status='blocked',token=NULL WHERE token=?", (token,))
+
+    def release(self, token: str) -> None:
+        db = self._connection()
+        with db:
+            db.execute("DELETE FROM shown WHERE token=? AND status='pending'", (token,))
+
+    def failed(self, scope: str, uids: Iterable[str], ttl: float = 300) -> None:
+        """Не застреваем на одних и тех же восьми битых/слишком больших файлах."""
+        db = self._connection()
+        with db:
+            db.execute('DELETE FROM failed WHERE retry_at<=?', (time.time(),))
+            db.executemany('INSERT OR REPLACE INTO failed VALUES (?,?,?)',
+                           [(scope, uid, time.time() + ttl) for uid in set(uids)])
+
+    def remember(self, scope: str, uid: str) -> None:
+        db = self._connection()
+        with db:
+            db.execute("INSERT OR IGNORE INTO shown VALUES (?,?,'sent',NULL,?)",
+                       (scope, uid, time.time()))
 
     def save(self) -> None:
-        """Атомарная запись на диск (если есть что сохранять)."""
-        if not self._dirty:
-            return
-        snapshot = {k: list(v) for k, v in self._data.items() if v}
-        self._dirty = False
-        try:
-            self._write(snapshot)
-        except OSError as e:
-            self._dirty = True
-            logger.warning(f"Не удалось сохранить память показанных артов: {e}")
+        # Compatibility: every mutation is already committed, no periodic JSON write.
+        if self._db is not None:
+            self._db.commit()
 
-    def _write(self, snapshot: dict) -> None:
-        os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
-        tmp = self.path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(snapshot, f, ensure_ascii=False)
-        os.replace(tmp, self.path)
-
-    async def autosave_loop(self, interval: float = 30.0) -> None:
-        while True:
-            await asyncio.sleep(interval)
-            if not self._dirty:
-                continue
-            snapshot = {k: list(v) for k, v in self._data.items() if v}
-            self._dirty = False
-            try:
-                await asyncio.to_thread(self._write, snapshot)
-            except OSError as e:
-                self._dirty = True
-                logger.warning(f"Не удалось сохранить память показанных артов: {e}")
+    def close(self) -> None:
+        if self._db is not None:
+            self._db.close()
+            self._db = None

@@ -1,25 +1,27 @@
 """Booru-источники (Gelbooru, Konachan, Safebooru): HTTP, разбор ответов, поиск.
 
-Как ищем: страницы идут по убыванию score (стр. 0 = топ-100 по лайкам).
-Берём стр. 0; если свежих (ещё не показанных) лучших артов мало — догружаем
-следующие страницы, потом запрос с `nude`. Страницы кэшируются на 10 минут,
-поэтому повторные запросы того же тега почти не дёргают API.
+Обходим всю доступную API выдачу, затем фильтруем и ранжируем её.
+Полный результат кэшируется на 10 минут. Долгий обход возобновляется,
+а ошибки API никогда не подменяются возвратом ранее показанного.
 """
 import asyncio
 import json
+import hashlib
 import logging
 import os
-import re
 import time
 import xml.etree.ElementTree as ET
 from collections import OrderedDict
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from urllib.parse import urlsplit
+from weakref import WeakKeyDictionary
 
 import aiohttp
 
 import content_filter as cf
-from selection import order_candidates, post_uid
+from selection import post_uid, post_score
+from search_index import SearchIndex
 
 logger = logging.getLogger("gelbooru_bot.booru")
 
@@ -115,18 +117,21 @@ def parse_posts_page(text: str) -> tuple[list[dict] | None, int | None]:
     else:
         if isinstance(data, dict):
             count = _to_int((data.get("@attributes") or {}).get("count"))
+            if "post" not in data and count != 0:
+                return None, count
             post = data.get("post", [])
             if isinstance(post, dict):           # один пост приходит словарём
                 post = [post]
             return (post if isinstance(post, list) else []), count
-        return (data if isinstance(data, list) else []), None
+        return (data if isinstance(data, list) else None), None
     try:
         root = ET.fromstring(text)
+        if root.tag != "posts":
+            return None, None
         return [p.attrib for p in root.iter("post")], _to_int(root.attrib.get("count"))
     except ET.ParseError:
         pass
-    urls = re.findall(r'file_url="([^"]+)"', text or "")
-    return ([{"file_url": u} for u in urls] if urls else None), None
+    return None, None
 
 
 def parse_posts(text: str) -> list[dict] | None:
@@ -149,7 +154,6 @@ class Source:
     name = ""
     referer = ""
     page_size = 100
-    max_pages = 6               # глубже стр. 5 (ранг ~600 по лайкам) не лезем
     ratings: frozenset = cf.NSFW_RATINGS
 
     def request(self, tags: list[str], page: int) -> tuple[str, dict]:
@@ -264,6 +268,12 @@ class Safebooru(Source):
 CACHE_TTL = 600.0
 CACHE_MAX = 80
 _cache: "OrderedDict[tuple, tuple[float, list[dict], int | None]]" = OrderedDict()
+_api_limits = WeakKeyDictionary()
+
+
+def api_limiter(source: Source) -> asyncio.Semaphore:
+    by_source = _api_limits.setdefault(asyncio.get_running_loop(), {})
+    return by_source.setdefault(source.name, asyncio.Semaphore(3))
 
 
 async def fetch_page(source: Source, tags: list[str], page: int) -> tuple[list[dict], int | None]:
@@ -273,8 +283,17 @@ async def fetch_page(source: Source, tags: list[str], page: int) -> tuple[list[d
         _cache.move_to_end(key)
         return hit[1], hit[2]
     url, params = source.request(tags, page)
-    raw, count = parse_posts_page(await fetch_text(url, params))
-    posts = [source.normalize(p) for p in (raw or []) if isinstance(p, dict)]
+    async with api_limiter(source):
+        raw, count = parse_posts_page(await fetch_text(url, params))
+    if raw is None or any(not isinstance(p, dict) for p in raw):
+        raise SourceError("bad", "Ответ API не является списком постов")
+    for post in raw:
+        for name in ("tags", "rating", "md5", "hash"):
+            if post.get(name) is not None and not isinstance(post[name], str):
+                raise SourceError("bad", f"Некорректное поле API: {name}")
+        if post.get("id") is None and not (post.get("md5") or post.get("hash")):
+            raise SourceError("bad", "Пост API без идентификатора")
+    posts = [source.normalize(p) for p in raw]
     _cache[key] = (time.monotonic(), posts, count)
     _cache.move_to_end(key)
     while len(_cache) > CACHE_MAX:
@@ -282,95 +301,140 @@ async def fetch_page(source: Source, tags: list[str], page: int) -> tuple[list[d
     return posts, count
 
 
-# ── Поиск кандидатов ──────────────────────────────────────────────────────────
-NEED_FRESH = 5          # столько свежих лучших артов хватает, чтобы не листать дальше
-NUDE_PAGES = 3          # сколько страниц добирать запросом «… nude»
-CANDIDATE_LIMIT = 30
+# ── Полный, возобновляемый обход выдачи ───────────────────────────────────────
+# Нет потолка страниц/постов. Временной бюджет ограничивает ОДИН вызов,
+# а не область поиска: незавершённый обход продолжается следующим запросом.
+SCAN_CONCURRENCY = 3
+SCAN_TIMEOUT = float(os.environ.get("SEARCH_TIMEOUT_SECONDS", "120"))
+if not 0 < SCAN_TIMEOUT <= 600:
+    raise ValueError("SEARCH_TIMEOUT_SECONDS должен быть числом от 0 (не включая) до 600")
+SCAN_CACHE_MAX = 4
 
 
 @dataclass
 class SearchResult:
-    candidates: list[dict]
-    errors: list[str] = field(default_factory=list)   # kind'ы SourceError
-    fetched: int = 0                                   # сколько постов пришло всего
+    candidates: Sequence[dict]
+    errors: list[str] = field(default_factory=list)
+    fetched: int = 0
+    total: int | None = None
+    complete: bool = False
+    allowed: int = 0
+
+
+@dataclass
+class ScanState:
+    index: SearchIndex = field(default_factory=SearchIndex)
+    allowed: int = 0
+    signatures: set[str] = field(default_factory=set)
+    next_page: int = 0
+    page_size: int = 100
+    total: int | None = None
+    fetched: int = 0
+    complete: bool = False
+    updated: float = field(default_factory=time.monotonic)
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+
+_scans: "OrderedDict[tuple, ScanState]" = OrderedDict()
+
+
+def clear_search_cache() -> None:
+    _cache.clear()
+    _scans.clear()
+
+
+async def _scan_all(source: Source, tags: list[str], state: ScanState,
+                    require_nudity: bool) -> None:
+    groups = cf.focus_groups_for(tags)
+    nudity = cf.requested_nudity_tags(groups)
+    async with state.lock:
+        while not state.complete:
+            if state.next_page == 0:
+                pages = [0]
+            elif state.total is not None:
+                page_count = (state.total + state.page_size - 1) // state.page_size
+                if state.next_page >= page_count:
+                    if state.fetched < state.total:
+                        raise SourceError("incomplete", "API вернул меньше постов, чем count")
+                    state.complete = True
+                    break
+                pages = list(range(state.next_page,
+                                   min(page_count, state.next_page + SCAN_CONCURRENCY)))
+            else:
+                pages = list(range(state.next_page, state.next_page + SCAN_CONCURRENCY))
+            results = await asyncio.gather(*(fetch_page(source, tags, n) for n in pages),
+                                           return_exceptions=True)
+            # Consume in page order. If a page fails, the cursor does NOT skip it.
+            # Other successful pages remain cached for the next attempt.
+            for page, result in zip(pages, results):
+                if isinstance(result, BaseException):
+                    if isinstance(result, asyncio.CancelledError):
+                        raise result
+                    if isinstance(result, SourceError):
+                        raise result
+                    logger.error("[%s] страница %s: %s", source.name, page, type(result).__name__)
+                    raise SourceError("down", "Не удалось прочитать страницу")
+                posts, count = result
+                if page == 0:
+                    state.total = count if count is not None and count >= 0 else None
+                    state.page_size = source.page_size
+                    if posts and state.total is not None and state.total > len(posts):
+                        # Some APIs cap the requested limit. Follow actual offsets.
+                        state.page_size = min(source.page_size, len(posts))
+                if not posts:
+                    if state.total is not None and state.fetched < state.total:
+                        raise SourceError("incomplete", "Пустая страница до заявленного конца")
+                    state.complete = True
+                    break
+                ids = sorted(str(p.get("id") or post_uid(p)) for p in posts)
+                signature = hashlib.sha256("\0".join(ids).encode()).hexdigest()
+                if signature in state.signatures:
+                    raise SourceError("incomplete", "API повторяет страницу вместо пагинации")
+                records = []
+                for offset, post in enumerate(posts):
+                    site_id = f"{post.get('_site')}:{post['id']}" if post.get('id') is not None else ""
+                    allowed = int(cf.post_is_allowed(post, source.ratings))
+                    strict = int(not require_nudity or cf.has_nudity(post, nudity))
+                    records.append((post_uid(post), site_id, json.dumps(post), allowed, strict,
+                                    cf.focus_tier(post, groups), post_score(post), state.fetched + offset))
+                state.allowed += state.index.add(records)
+                state.signatures.add(signature)
+                state.fetched += len(posts)
+                state.next_page = page + 1
+                state.updated = time.monotonic()
+        state.updated = time.monotonic()
 
 
 async def search(source: Source, tags: list[str], recent, *,
                  require_nudity: bool = True) -> SearchResult:
-    """Кандидаты к показу: лучшие свежие сначала (см. selection.order_candidates)."""
-    groups = cf.focus_groups_for(tags)
-    nudity = cf.requested_nudity_tags(groups)
-    best_tier = cf.TOP_TIER if groups else 0
-    seen = set(recent)
-    strict: list[dict] = []
-    broad: list[dict] = []
-    uids: set[str] = set()
-    res = SearchResult(candidates=[])
+    """Ранжирует ВСЮ доступную выдачу; ошибки/таймаут не разрешают повторы.
 
-    def absorb(posts: list[dict]) -> None:
-        res.fetched += len(posts)
-        for p in posts:
-            uid = post_uid(p)
-            if uid in uids:
-                continue
-            uids.add(uid)
-            if not cf.post_is_allowed(p, source.ratings):
-                continue
-            if not require_nudity or cf.has_nudity(p, nudity):
-                strict.append(p)
-            else:
-                broad.append(p)
-
-    def fresh_strict(min_tier: int = 0) -> int:
-        return sum(1 for p in strict
-                   if post_uid(p) not in seen and cf.focus_tier(p, groups) >= min_tier)
-
-    async def load(extra: list[str], pages) -> bool:
-        """Грузит страницы параллельно. True — дальше страниц по запросу нет."""
-        pages = list(pages)
-        if not pages:
-            return True
-        results = await asyncio.gather(*(fetch_page(source, tags + extra, n) for n in pages),
-                                       return_exceptions=True)
-        ended = False
-        for n, r in zip(pages, results):
-            if isinstance(r, BaseException):
-                res.errors.append(getattr(r, "kind", "down"))
-                if not isinstance(r, SourceError):
-                    logger.error(f"[{source.name}] стр. {n}: {type(r).__name__}: {r}")
-                ended = True
-                continue
-            posts, count = r
-            absorb(posts)
-            if len(posts) < source.page_size or (count is not None
-                                                 and (n + 1) * source.page_size >= count):
-                ended = True
-        return ended
-
-    def next_pages(first_count_hint: int | None, limit: int) -> range:
-        last = limit - 1
-        if first_count_hint is not None:
-            last = min(last, (first_count_hint - 1) // source.page_size)
-        return range(1, last + 1)
-
-    # 1) Топ по score; не хватает свежего топ-фокуса — листаем глубже.
+    При отсутствии count идём до пустой страницы, а не до произвольного лимита.
+    API должен реально поддерживать пагинацию: ограничение сервиса не обходим.
+    """
+    key = (source.name, tuple(sorted(tags)), require_nudity)
+    state = _scans.get(key)
+    if state is None or (not state.lock.locked()
+                         and time.monotonic() - state.updated >= CACHE_TTL):
+        state = ScanState(page_size=source.page_size)
+        _scans[key] = state
+    _scans.move_to_end(key)
+    # Bound number of cached queries, NOT depth of a query. Active scans survive.
+    for old_key in list(_scans):
+        if len(_scans) <= SCAN_CACHE_MAX:
+            break
+        if old_key != key and not _scans[old_key].lock.locked():
+            del _scans[old_key]
     try:
-        first, count = await fetch_page(source, tags, 0)
-    except SourceError as e:
-        res.errors.append(e.kind)
-        return res
-    absorb(first)
-    if len(first) >= source.page_size and fresh_strict(best_tier) < NEED_FRESH:
-        await load([], next_pages(count, source.max_pages))
-
-    # 2) Мало свежего раздетого — запрос с nude: сервер сам отдаст раздетые.
-    #    Если по тегу вообще ничего нет — с nude тоже не будет, не дёргаем API.
-    if require_nudity and first and fresh_strict() < NEED_FRESH and "nude" not in tags:
-        if not await load(["nude"], [0]) and fresh_strict() < NEED_FRESH:
-            await load(["nude"], range(1, NUDE_PAGES))
-
-    res.candidates = order_candidates(strict, recent, groups, broad)[:CANDIDATE_LIMIT]
-    return res
+        async with asyncio.timeout(SCAN_TIMEOUT):
+            await _scan_all(source, tags, state, require_nudity)
+    except TimeoutError:
+        state.updated = time.monotonic()
+        return SearchResult([], ["scan_pending"], state.fetched, state.total)
+    except SourceError as error:
+        return SearchResult([], [error.kind], state.fetched, state.total)
+    return SearchResult(state.index.candidates(recent), fetched=state.fetched,
+                        total=state.total, complete=True, allowed=state.allowed)
 
 
 # ── Скачивание медиа ──────────────────────────────────────────────────────────

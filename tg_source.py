@@ -181,17 +181,19 @@ async def fetch_channel_arts(client: TelegramClient, alias: str, peer: str,
         msgs.sort(key=lambda m: m.id)
         head = msgs[0]
         caption = next((m.message for m in msgs if getattr(m, "message", None)), "")
+        canonical_peer = getattr(getattr(head, "peer_id", None), "channel_id", None) or peer_val
         posts.append({
             "id": head.id,
             # реакции у альбома висят на одном из сообщений — берём максимум
             "score": max(reaction_count(m) for m in msgs),
-            "_site": f"TG:{alias}",
+            "_site": f"TG:{canonical_peer}",
             "_alias": alias,
             "_username": username,
             "_peer_id": peer_id,
             "_peer": peer_val,
             # общий uid альбома: анти-повтор не покажет его же через другую картинку
-            "_uid": f"TG:{alias}:{key}",
+            "_uid": f"TG:{canonical_peer}:{key}",
+            "_legacy_uid": f"TG:{alias}:{key}",
             "_msg": head,
             "_msgs": msgs,
             "caption": caption[:200],

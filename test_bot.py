@@ -13,6 +13,9 @@ import bot_gelbooru as b
 import content_filter as cf
 import selection as sel
 
+# Never touch the production history during tests.
+b.memory = sel.ShownMemory(":memory:")
+
 passed = 0
 failed = 0
 
@@ -167,8 +170,7 @@ oc = sel.order_candidates(P, deque(["y"]))
 check("seen art excluded", all(p["md5"] != "y" for p in oc))
 check("best of remaining leads", oc[0]["md5"] == "z")
 oc2 = sel.order_candidates(P, deque(["x", "y", "z"]))
-check("exhausted -> oldest-shown leads", oc2[0]["md5"] == "x")
-check("exhausted -> full pool returned", len(oc2) == 3)
+check("exhausted -> repeat forbidden", oc2 == [])
 F = [
     {"md5": "on_lo", "tags": "huge_breasts", "score": 5},
     {"md5": "on_hi", "tags": "large_breasts", "score": 40},
@@ -189,31 +191,30 @@ check("string/None scores safe",
 
 print("== ShownMemory ==")
 with tempfile.TemporaryDirectory() as d:
-    path = os.path.join(d, "sub", "mem.json")
+    path = os.path.join(d, "sub", "shown.sqlite3")
     m = sel.ShownMemory(path)
-    m.remember("k1", "a")
-    m.remember("k1", "b")
-    m.remember("k2", "c")
-    m.remember("k1", "a")          # повтор переезжает в конец
-    check("recent order", list(m.recent("k1")) == ["b", "a"])
-    check("unknown key -> empty, not stored", len(m.recent("nope")) == 0 and "nope" not in m._data)
-    m.save()
+    m.remember("channel1", "a")
+    m.remember("channel1", "b")
+    m.remember("channel2", "c")
+    m.remember("channel1", "a")
+    check("history is a set", m.recent("channel1") == {"a", "b"})
+    check("unknown channel -> empty", not m.recent("unknown"))
+    m.close()
     m2 = sel.ShownMemory(path)
     m2.load()
-    check("roundtrip", list(m2.recent("k1")) == ["b", "a"] and list(m2.recent("k2")) == ["c"])
-    check("LRU order: k1 most recent", list(m2._data)[-1] == "k1")
-    old = sel.RECENT_MAX_KEYS
-    sel.RECENT_MAX_KEYS = 2
-    m2.remember("k3", "z")
-    sel.RECENT_MAX_KEYS = old
-    check("evicts least recently used key", "k2" not in m2._data and "k1" in m2._data)
+    check("immediate durable roundtrip", m2.recent("channel1") == {"a", "b"}
+          and m2.recent("channel2") == {"c"})
+    for i in range(600):
+        m2.remember("channel1", str(i))
+    check("history never evicts oldest", "a" in m2.recent("channel1")
+          and len(m2.recent("channel1")) == 602)
+    m2.close()
 
 
 # ── search() на фейковом источнике ────────────────────────────────────────────
 class FakeSource(booru.Source):
     name = "Fake"
     page_size = 4
-    max_pages = 4
     ratings = cf.NSFW_RATINGS
 
     def post_url(self, post):
@@ -223,6 +224,7 @@ class FakeSource(booru.Source):
 def fake_pages(pages: dict, count=None):
     """pages: {(tuple(tags), page): [posts]} → подмена booru.fetch_page + журнал вызовов."""
     calls = []
+    booru.clear_search_cache()
 
     async def fetch(source, tags, page):
         calls.append((tuple(tags), page))
@@ -243,15 +245,13 @@ async def search_tests():
     orig = booru.fetch_page
     try:
         print("== search: paging ==")
-        old_need = booru.NEED_FRESH
-        booru.NEED_FRESH = 2
         pages = {(("t",), 0): [nude(i) for i in range(4)],
                  (("t",), 1): [nude(i) for i in range(4, 8)],
                  (("t",), 2): [nude(i) for i in range(8, 12)],
                  (("t",), 3): [nude(i) for i in range(12, 14)]}
         booru.fetch_page, calls = fake_pages(pages)
         r = await booru.search(FakeSource(), ["t"], deque())
-        check("fresh top: only page 0 fetched", calls == [(("t",), 0)])
+        check("full scan even with fresh top", all((("t",), n) in calls for n in range(4)))
         check("best first", r.candidates[0]["md5"] == "n0")
 
         booru.fetch_page, calls = fake_pages(pages)
@@ -265,11 +265,11 @@ async def search_tests():
               sorted(c[1] for c in calls if c[0] == ("t",)) == [0, 1])
 
         print("== search: nude phase & dressed fallback ==")
-        pages2 = {(("t",), 0): [dressed_post(i) for i in range(3)],
+        pages2 = {(("t",), 0): [dressed_post(i) for i in range(3)] + [nude(1)],
                   (("t", "nude"), 0): [nude(1)]}
         booru.fetch_page, calls = fake_pages(pages2)
         r = await booru.search(FakeSource(), ["t"], deque())
-        check("nude phase requested", (("t", "nude"), 0) in calls)
+        check("no narrow nude supplement needed after full scan", all(c[0] == ("t",) for c in calls))
         check("strict (nude) first, dressed after",
               [p["md5"] for p in r.candidates] == ["n1", "d0", "d1", "d2"])
 
@@ -292,10 +292,10 @@ async def search_tests():
 
         async def broken(source, tags, page):
             raise booru.SourceError("auth", "401")
+        booru.clear_search_cache()
         booru.fetch_page = broken
         r = await booru.search(FakeSource(), ["t"], deque())
         check("source error reported, no candidates", r.errors == ["auth"] and not r.candidates and r.fetched == 0)
-        booru.NEED_FRESH = old_need
     finally:
         booru.fetch_page = orig
 
@@ -357,11 +357,11 @@ async def search_tests():
     check("413 -> next candidate sent", sent["md5"] == "b" and fu.sent == [{"content": "b"}])
     check("sent art remembered", "b" in b.memory.recent("T|x"))
 
-    b._inflight.add(("T|y", "a"))
+    reserved = b.memory.reserve("T|y", {"a"})
     fu = Followup()
     sent, _ = await b.send_first_fitting(Inter(fu), "T|y", cands, payload_ok)
     check("in-flight art skipped (no double send)", sent["md5"] == "b")
-    b._inflight.clear()
+    b.memory.release(reserved)
 
     async def payload_none(post):
         return None, "too_big"
@@ -370,7 +370,8 @@ async def search_tests():
     check("nothing fits -> None + reasons", sent is None and reasons == {"too_big"})
     check("too_big text", "слишком большие" in b.nothing_sent_text("x", "G", reasons))
     check("error text", "Не удалось скачать" in b.nothing_sent_text("x", "G", {"error"}))
-    check("no leftover in-flight", not b._inflight)
+    check("failed downloads release pending", not b.memory._connection().execute(
+        "SELECT 1 FROM shown WHERE scope='T|z' AND status='pending'").fetchone())
 
 
 asyncio.run(search_tests())
@@ -397,5 +398,6 @@ check("plain channel refused", b.channel_allows_nsfw(_ChanInter(1, _Chan(False))
 check("DM refused (no age gate)", b.channel_allows_nsfw(_ChanInter(None, _Chan(True))) is False)
 check("channel without is_nsfw refused", b.channel_allows_nsfw(_ChanInter(1, object())) is False)
 
+b.memory.close()
 print(f"\n==== {passed} passed, {failed} failed ====")
 raise SystemExit(1 if failed else 0)

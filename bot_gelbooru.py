@@ -6,6 +6,8 @@
   selection      — анти-повтор и порядок кандидатов;
   tg_source      — Telegram-каналы (userbot на Telethon).
 """
+import asyncio
+import hashlib
 import logging
 import os
 import random
@@ -27,7 +29,7 @@ load_dotenv(os.path.join(BASE_DIR, ".env"))
 import booru  # noqa: E402
 import content_filter as cf  # noqa: E402
 import tg_source  # noqa: E402
-from selection import ShownMemory, order_candidates, post_uid, recent_key  # noqa: E402
+from selection import ShownMemory, channel_scope, order_candidates, post_uid, post_uids  # noqa: E402
 
 logging.basicConfig(
     level=logging.INFO,
@@ -36,7 +38,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger('gelbooru_bot')
 
-VERSION = "3.0.1"
+VERSION = "3.1.0"
 
 
 def env_any(*names: str) -> str | None:
@@ -57,7 +59,8 @@ GUILD_IDS = [
 
 # Где хранить память показанных артов (на хостинге — постоянный диск).
 DATA_DIR = os.environ.get("DATA_DIR") or BASE_DIR
-memory = ShownMemory(os.path.join(DATA_DIR, "recent_shown.json"))
+memory = ShownMemory(os.path.join(DATA_DIR, "shown.sqlite3"),
+                     legacy_path=os.path.join(DATA_DIR, "recent_shown.json"))
 
 GELBOORU = booru.Gelbooru(env_any("GELBOORU_API_KEY"), env_any("GELBOORU_USER_ID"))
 KONACHAN = booru.Konachan()
@@ -201,7 +204,18 @@ def tag_verdict(tags: list[str]) -> str | None:
 
 async def answer_verdict(interaction: nextcord.Interaction, verdict: str):
     if verdict == "kanzaki" and os.path.isfile(KANZAKI_HIDERI_IMAGE):
-        return await interaction.response.send_message(file=nextcord.File(KANZAKI_HIDERI_IMAGE))
+        await interaction.response.defer()
+        async def asset_payload(_post):
+            with open(KANZAKI_HIDERI_IMAGE, "rb") as stream:
+                data = stream.read()
+            return {"file": nextcord.File(BytesIO(data), filename="kanzaki_hideri.jpg"),
+                    "_uids": content_uids(data)}, ""
+        sent, reasons = await send_first_fitting(
+            interaction, channel_scope(interaction),
+            [{"_uid": "asset:kanzaki_hideri"}], asset_payload)
+        if sent is None:
+            await safe_followup(interaction, nothing_sent_text("kanzaki_hideri", "бота", reasons))
+        return
     if verdict == "venti":
         return await interaction.response.send_message(VENTI_WARNING)
     if verdict == "lgbt":
@@ -234,51 +248,92 @@ def _send_kwargs(payload: dict) -> dict:
     return out
 
 
-MAX_DOWNLOAD_TRIES = 8                # сколько постов пробуем скачать за запрос
-_inflight: set[tuple[str, str]] = set()  # (запрос, арт), которые прямо сейчас отправляются
+MAX_DOWNLOAD_TRIES = 8  # ограничение попыток скачивания, НЕ глубины поиска
+SEND_TIMEOUT = 180.0
 
 
-async def send_first_fitting(interaction, rkey: str, candidates: list[dict], make_payload):
-    """Отправляет первого кандидата, который скачался и влез в лимит Discord.
+def content_uids(data: bytes) -> set[str]:
+    # MD5 matches API metadata across sources; SHA256 checks actual bytes.
+    return {hashlib.md5(data, usedforsecurity=False).hexdigest(),
+            "sha256:" + hashlib.sha256(data).hexdigest()}
 
-    → (отправленный пост | None, множество причин неудач).
-    Посты, которые в эту секунду отправляет параллельный запрос с тем же
-    тегом, пропускаются — иначе двое одновременно получат один и тот же арт.
+
+def close_payload(payload: dict | None) -> None:
+    if payload:
+        files = list(payload.get("files") or [])
+        if payload.get("file") is not None:
+            files.append(payload["file"])
+        for file in files:
+            file.close()
+
+
+async def send_first_fitting(interaction, scope: str, candidates: list[dict], make_payload):
+    """Атомарный резерв -> download -> проверка байтов -> send -> durable sent.
+
+    Актуальная история проверяется перед КАЖДОЙ отправкой, даже если кандидаты
+    были выбраны параллельным запросом. Неясный исход send сохраняет резерв.
     """
     reasons: set[str] = set()
     tries = 0
-    for post in candidates:
-        key = (rkey, post_uid(post))
-        if key in _inflight:
-            continue
-        if tries >= MAX_DOWNLOAD_TRIES:
-            break
-        tries += 1
-        _inflight.add(key)
-        try:
-            payload, reason = await make_payload(post)
-            if payload is None:
-                reasons.add(reason or "error")
-                continue
-            try:
-                await interaction.followup.send(**_send_kwargs(payload))
-            except nextcord.HTTPException as e:
-                if e.status == 413:
-                    logger.warning("413 от Discord — пробую следующего кандидата")
-                    reasons.add("too_big")
+    try:
+        async with asyncio.timeout(SEND_TIMEOUT):
+            for post in candidates:
+                if tries >= MAX_DOWNLOAD_TRIES:
+                    break
+                ids = post_uids(post)
+                token = memory.reserve(scope, ids)
+                if token is None:
+                    reasons.add("duplicate")
+                    logger.info("[anti-repeat] заблокирован повтор %s в %s", post_uid(post), scope)
                     continue
-                raise
-            memory.remember(rkey, key[1])
-            return post, reasons
-        finally:
-            _inflight.discard(key)
+                tries += 1
+                payload = None
+                delivery_started = False
+                try:
+                    payload, reason = await make_payload(post)
+                    if payload is None:
+                        reasons.add(reason or "error")
+                        memory.failed(scope, ids)
+                        continue
+                    fingerprints = payload.get("_uids") or set()
+                    if fingerprints and not memory.extend(scope, token, fingerprints):
+                        memory.mark_blocked(token)
+                        reasons.add("duplicate")
+                        logger.info("[anti-repeat] совпали байты файла %s в %s", post_uid(post), scope)
+                        continue
+                    delivery_started = True
+                    try:
+                        await interaction.followup.send(**_send_kwargs(payload))
+                    except nextcord.HTTPException as error:
+                        if error.status < 500:
+                            # An explicit rejection is NOT an ambiguous delivery.
+                            delivery_started = False
+                        if error.status == 413:
+                            reasons.add("too_big")
+                            memory.failed(scope, ids)
+                            continue
+                        raise
+                    memory.mark_sent(token)
+                    logger.info("[anti-repeat] отправлен %s в %s", post_uid(post), scope)
+                    return post, reasons
+                finally:
+                    if not delivery_started:
+                        memory.release(token)
+                    # A timeout/network failure after send started leaves pending.
+                    close_payload(payload)
+    except TimeoutError:
+        reasons.add("timeout")
     return None, reasons
 
 
 def nothing_sent_text(display_tag: str, label: str, reasons: set[str]) -> str:
-    if reasons and reasons <= {"too_big"}:
-        return f"❌ По тегу `{display_tag}` все подходящие файлы слишком большие для загрузки."
-    return f"❌ Не удалось скачать арты с {label}. Попробуй ещё раз."
+    if reasons and reasons <= {"duplicate"}:
+        return "🚫 Повторные арты заблокированы. Попробуй ещё раз — проверю следующие доступные кандидаты."
+    if "timeout" in reasons:
+        return "⏳ Истекло время скачивания/отправки. Повторы не отправлены; попробуй позже."
+    if "too_big" in reasons and reasons <= {"too_big", "duplicate"}:
+        return f"❌ Проверенные новые файлы по `{display_tag}` слишком большие. Попробуй ещё раз: возьму следующие."
+    return f"❌ Не удалось скачать проверенные новые арты с {label}. Попробуй ещё раз."
 
 
 def source_error_text(label: str, errors: list[str]) -> str:
@@ -286,6 +341,8 @@ def source_error_text(label: str, errors: list[str]) -> str:
         return f"❌ {label} отказал в доступе (нужен API-ключ или сайт заблокирован)."
     if "rate" in errors:
         return f"⏳ {label} ограничил частоту запросов — попробуй через минуту."
+    if "bad" in errors or "incomplete" in errors:
+        return f"⚠️ {label} вернул некорректную/неполную выдачу. Повторы запрещены; попробуй позже."
     return f"❌ {label} сейчас не отвечает. Попробуй позже."
 
 
@@ -354,9 +411,9 @@ async def build_booru_payload(source, post: dict, display_tag: str, max_size: in
         content = (f"🎬 **Видео** `{display_tag}` • 📊 {post.get('score', 'N/A')} • "
                    f"🔞 {rating_label(post)} • {size / MB:.1f} MB • "
                    f"[Открыть пост](<{source.post_url(post)}>)")
-        return {"content": content, "file": file}, ""
+        return {"content": content, "file": file, "_uids": content_uids(media.data)}, ""
     embed = build_post_embed(source, post, display_tag, size, filename, media.reduced)
-    return {"embed": embed, "file": file}, ""
+    return {"embed": embed, "file": file, "_uids": content_uids(media.data)}, ""
 
 
 # ── Поиск по booru ────────────────────────────────────────────────────────────
@@ -389,19 +446,28 @@ async def run_booru_search(interaction: nextcord.Interaction, raw_tags: tuple, s
         return
 
     display_tag = " + ".join(tags)
-    rkey = recent_key(source.name, tags)
+    scope = channel_scope(interaction)
     try:
-        res = await booru.search(source, tags, memory.recent(rkey), require_nudity=nsfw)
-        if not res.candidates:
-            if res.errors and not res.fetched:
-                text = source_error_text(source.name, res.errors)
+        res = await booru.search(source, tags, memory.recent(scope), require_nudity=nsfw)
+        if res.errors:
+            if "scan_pending" in res.errors:
+                total = f" из примерно {res.total:,}" if res.total is not None else ""
+                text = (f"⏳ Полный поиск ещё не завершён: просмотрено {res.fetched:,}{total} постов. "
+                        "Повтори запрос — продолжу с сохранённой страницы. Старые арты не отправляю.")
             else:
-                text = f"❌ По тегу `{display_tag}` на {source.name} ничего не найдено."
+                text = source_error_text(source.name, res.errors)
+            return await interaction.followup.send(text)
+        if not res.candidates:
+            if res.allowed:
+                text = ("✅ Новых доступных артов для этого канала по запросу не осталось "
+                        "(история показов/резервы/временные ошибки файлов). Повтор запрещён.")
+            else:
+                text = f"❌ По тегу `{display_tag}` на {source.name} ничего не найдено после фильтров."
             return await interaction.followup.send(text)
 
         max_size = max_upload_size(interaction)
         sent, reasons = await send_first_fitting(
-            interaction, rkey, res.candidates,
+            interaction, scope, res.candidates,
             lambda p: build_booru_payload(source, p, display_tag, max_size))
         if sent is None:
             await safe_followup(interaction, nothing_sent_text(display_tag, source.name, reasons))
@@ -579,6 +645,7 @@ async def build_tg_payload(post: dict, max_size: int):
 
     has_video = any(_is_video_msg(m) for m in media_msgs)
     files, total, skipped = [], 0, 0
+    fingerprints: set[str] = set()
     for m in media_msgs:
         remaining = max_size - total
         f = getattr(m, "file", None)
@@ -593,6 +660,7 @@ async def build_tg_payload(post: dict, max_size: int):
         filename = f"tg_{post['_alias']}_{m.id}.{tg_source.media_ext(m)}"
         files.append(nextcord.File(BytesIO(data), filename=filename))
         total += size
+        fingerprints.update(content_uids(data))
 
     link = tg_source.post_link(post)
     head = f"{'🎬' if has_video else '🖼'} **{post['_alias']}** • ❤️ {post.get('score', 0)}"
@@ -609,7 +677,7 @@ async def build_tg_payload(post: dict, max_size: int):
         parts.append(f"➕ ещё {skipped} в посте")
     if link:
         parts.append(f"[Открыть пост](<{link}>)")
-    return {"content": " • ".join(parts), "files": files}, ""
+    return {"content": " • ".join(parts), "files": files, "_uids": fingerprints}, ""
 
 
 async def run_tg_search(interaction: nextcord.Interaction, alias: str | None):
@@ -641,16 +709,19 @@ async def run_tg_search(interaction: nextcord.Interaction, alias: str | None):
         logger.warning(f"[{label}] defer не удался: {e}")
         return
 
-    rkey = recent_key(label, [chosen["alias"]])
+    scope = channel_scope(interaction)
     try:
         raw = await tg_source.fetch_channel_arts(tg_client, chosen["alias"], chosen["peer"])
         if not raw:
             return await interaction.followup.send(
                 f"❌ В канале `{chosen['alias']}` не нашлось подходящих артов.")
-        candidates = order_candidates(raw, memory.recent(rkey))[:booru.CANDIDATE_LIMIT]
+        candidates = order_candidates(raw, memory.recent(scope))
+        if not candidates:
+            return await interaction.followup.send(
+                "✅ В просмотренной истории Telegram нет новых артов для этого канала. Повтор запрещён.")
         max_size = max_upload_size(interaction)
         sent, reasons = await send_first_fitting(
-            interaction, rkey, candidates, lambda p: build_tg_payload(p, max_size))
+            interaction, scope, candidates, lambda p: build_tg_payload(p, max_size))
         if sent is None:
             await safe_followup(interaction, nothing_sent_text(chosen["alias"], label, reasons))
     except NotFound:
@@ -757,6 +828,7 @@ async def on_application_command_error(interaction: nextcord.Interaction, error:
 async def on_close():
     memory.save()
     await booru.close_session()
+    booru.clear_search_cache()
     if tg_client is not None:
         try:
             await tg_client.disconnect()
@@ -792,12 +864,11 @@ def main() -> None:
         raise SystemExit("❌ Не задан токен бота: переменная DISCORD_BOT_TOKEN "
                          "(в окружении или в файле .env рядом с ботом).")
     memory.load()
-    bot.loop.create_task(memory.autosave_loop())
     bot.loop.create_task(start_health_server())
     try:
         bot.run(token)
     finally:
-        memory.save()
+        memory.close()
 
 
 if __name__ == "__main__":
