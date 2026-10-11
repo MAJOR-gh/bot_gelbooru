@@ -5,32 +5,23 @@
 TG_API_ID / TG_API_HASH из переменных окружения.
 """
 import json
-import os
 import logging
+import os
 import time
 
 from telethon import TelegramClient
 from telethon.sessions import StringSession
+
+import config
 
 logger = logging.getLogger("gelbooru_bot.tg")
 
 SESSION_NAME = "tg_userbot"
 
 
-def _env_any(*names: str) -> str | None:
-    """Первое непустое значение среди нескольких имён env (с обрезкой пробелов)."""
-    for n in names:
-        v = os.environ.get(n)
-        if v and v.strip():
-            return v.strip()
-    return None
-
-
-# Сессия строкой (для хостинга/Docker — файл *.session не доезжает через git).
-# Ловим несколько частых имён переменной; если задана — используем её, иначе
-# падаем на файловую сессию (локалка).
-SESSION_STRING = _env_any("TG_SESSION_STRING", "SESSION_STRING",
-                          "TG_SESSION", "STRING_SESSION", "TG_STRING_SESSION")
+# Сессия строкой (для хостинга/Docker — файл *.session не доезжает через git);
+# если не задана — файловая сессия (локалка).
+SESSION_STRING = config.TG_SESSION_STRING
 CHANNELS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tg_channels.json")
 
 # Сколько последних сообщений канала просматриваем за один запрос.
@@ -242,6 +233,13 @@ async def fetch_album_messages(client: TelegramClient, peer, msg) -> list:
         return None
     msgs.sort(key=lambda m: m.id)  # хронологический порядок, как в исходном посте
     return msgs or [msg]
+
+
+VIDEO_EXTS = frozenset({"mp4", "webm", "mov", "m4v", "gif"})
+
+
+def is_video(msg) -> bool:
+    return media_ext(msg) in VIDEO_EXTS
 
 
 def media_ext(msg) -> str:

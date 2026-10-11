@@ -28,5 +28,7 @@ data/
 # SQLite history and disposable search indexes (never ship runtime data)
 shown.sqlite3*
 .search-index-*
+tg_found_channels.json
+tools/tg_found_channels.json
 
 search_cache/
