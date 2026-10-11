@@ -2,13 +2,16 @@
 
 Запуск: python test_bot.py
 """
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 import asyncio
 import os
 import tempfile
 import time
 from collections import deque
 
-import booru
+import search
+import sources
 import bot_gelbooru as b
 import content_filter as cf
 import selection as sel
@@ -33,15 +36,15 @@ def check(name, cond):
 
 
 print("== parse_posts ==")
-check("json with post list", booru.parse_posts('{"post":[{"id":1},{"id":2}]}') == [{"id": 1}, {"id": 2}])
-check("json no post key -> []", booru.parse_posts('{"@attributes":{"count":0}}') == [])
-check("json single post dict -> wrapped", booru.parse_posts('{"post":{"id":7}}') == [{"id": 7}])
-check("json top-level list", booru.parse_posts('[{"id":1}]') == [{"id": 1}])
-check("xml parse", booru.parse_posts('<posts><post id="5" file_url="x"/></posts>')[0]["id"] == "5")
-check("garbage -> None", booru.parse_posts("not json not xml") is None)
+check("json with post list", sources.parse_posts('{"post":[{"id":1},{"id":2}]}') == [{"id": 1}, {"id": 2}])
+check("json no post key -> []", sources.parse_posts('{"@attributes":{"count":0}}') == [])
+check("json single post dict -> wrapped", sources.parse_posts('{"post":{"id":7}}') == [{"id": 7}])
+check("json top-level list", sources.parse_posts('[{"id":1}]') == [{"id": 1}])
+check("xml parse", sources.parse_posts('<posts><post id="5" file_url="x"/></posts>')[0]["id"] == "5")
+check("garbage -> None", sources.parse_posts("not json not xml") is None)
 check("count from @attributes",
-      booru.parse_posts_page('{"@attributes":{"count":250},"post":[]}')[1] == 250)
-check("count from xml", booru.parse_posts_page('<posts count="42"></posts>')[1] == 42)
+      sources.parse_posts_page('{"@attributes":{"count":250},"post":[]}')[1] == 250)
+check("count from xml", sources.parse_posts_page('<posts count="42"></posts>')[1] == 42)
 
 print("== post_is_clean ==")
 check("clean post", cf.post_is_clean({"tags": "1girl blue_hair smile nude"}) is True)
@@ -115,17 +118,17 @@ time.sleep(1.05)
 check("after window resets", cd.retry_after(1) == 0.0)
 
 print("== Gelbooru params ==")
-g = booru.Gelbooru("K", "U")
+g = sources.Gelbooru("K", "U")
 url, p = g.request(["1girl"], 2)
 check("includes api_key/user_id when set", p.get("api_key") == "K" and p.get("user_id") == "U")
 check("static fields", p["page"] == "dapi" and p["q"] == "index" and p["json"] == "1")
 check("page -> pid", p["pid"] == "2")
 check("query has sort + rating + excludes",
       p["tags"].startswith("1girl sort:score -rating:general") and "-loli" in p["tags"])
-check("omits api_key when empty", "api_key" not in booru.Gelbooru("", "").params(s="post"))
+check("omits api_key when empty", "api_key" not in sources.Gelbooru("", "").params(s="post"))
 
 print("== Konachan params ==")
-k = booru.Konachan()
+k = sources.Konachan()
 _, kp = k.request(["a", "b", "c", "d"], 0)
 check("page is 1-based", kp["page"] == "1")
 check("4 tags + order + rating = 6", kp["tags"].split() == ["a", "b", "c", "d", "order:score", "-rating:s"])
@@ -133,7 +136,7 @@ _, kp = k.request(["a", "b", "c", "d", "nude"], 0)
 check("never more than 6 tags, order:score kept",
       len(kp["tags"].split()) == 6 and "order:score" in kp["tags"].split())
 check("konachan rating normalized", k.normalize({"rating": "e", "author": "x"})["rating"] == "explicit")
-check("safebooru md5 from hash", booru.Safebooru().normalize({"hash": "ABC"})["md5"] == "abc")
+check("safebooru md5 from hash", sources.Safebooru().normalize({"hash": "ABC"})["md5"] == "abc")
 
 print("== focus ==")
 check("breasts -> {breasts}", cf.focus_groups_for(["breasts"]) == {"breasts"})
@@ -214,7 +217,7 @@ with tempfile.TemporaryDirectory() as d:
 
 
 # ── search() на фейковом источнике ────────────────────────────────────────────
-class FakeSource(booru.Source):
+class FakeSource(sources.Source):
     name = "Fake"
     page_size = 4
     ratings = cf.NSFW_RATINGS
@@ -224,12 +227,12 @@ class FakeSource(booru.Source):
 
 
 def fake_pages(pages: dict, count=None):
-    """pages: {(tuple(tags), page): [posts]} → подмена booru.fetch_page + журнал вызовов."""
+    """pages: {(tuple(tags), page): [posts]} → подмена sources.fetch_page + журнал вызовов."""
     calls = []
-    booru.clear_search_cache()
+    search.clear_search_cache()
     FakeSource.name = 'Fake-' + str(time.monotonic_ns())
 
-    async def fetch(source, tags, page):
+    async def fetch(source, tags, page, cursor=None):
         calls.append((tuple(tags), page))
         return list(pages.get((tuple(tags), page), [])), count
     return fetch, calls
@@ -245,43 +248,43 @@ def dressed_post(i):
 
 
 async def search_tests():
-    orig = booru.fetch_page
+    orig = search.fetch_page
     try:
         print("== search: paging ==")
         pages = {(("t",), 0): [nude(i) for i in range(4)],
                  (("t",), 1): [nude(i) for i in range(4, 8)],
                  (("t",), 2): [nude(i) for i in range(8, 12)],
                  (("t",), 3): [nude(i) for i in range(12, 14)]}
-        booru.fetch_page, calls = fake_pages(pages)
-        r = await booru.search(FakeSource(), ["t"], deque())
+        search.fetch_page, calls = fake_pages(pages)
+        r = await search.search(FakeSource(), ["t"], deque())
         check("full scan even with fresh top", all((("t",), n) in calls for n in range(4)))
         check("best first", r.candidates[0]["md5"] == "n0")
 
-        booru.fetch_page, calls = fake_pages(pages)
-        r = await booru.search(FakeSource(), ["t"], deque(["n0", "n1", "n2", "n3"]))
+        search.fetch_page, calls = fake_pages(pages)
+        r = await search.search(FakeSource(), ["t"], deque(["n0", "n1", "n2", "n3"]))
         check("page 0 seen -> deeper pages fetched", (("t",), 1) in calls and (("t",), 3) in calls)
         check("best unseen leads", r.candidates[0]["md5"] == "n4")
 
-        booru.fetch_page, calls = fake_pages(pages, count=6)
-        r = await booru.search(FakeSource(), ["t"], deque(["n0", "n1", "n2", "n3"]))
+        search.fetch_page, calls = fake_pages(pages, count=6)
+        r = await search.search(FakeSource(), ["t"], deque(["n0", "n1", "n2", "n3"]))
         check("count is advisory, later pages still searchable",
               (("t",), 2) in calls and (("t",), 3) in calls)
 
         print("== search: nude phase & dressed fallback ==")
         pages2 = {(("t",), 0): [dressed_post(i) for i in range(3)] + [nude(1)],
                   (("t", "nude"), 0): [nude(1)]}
-        booru.fetch_page, calls = fake_pages(pages2)
-        r = await booru.search(FakeSource(), ["t"], deque())
+        search.fetch_page, calls = fake_pages(pages2)
+        r = await search.search(FakeSource(), ["t"], deque())
         check("no narrow nude supplement needed after full scan", all(c[0] == ("t",) for c in calls))
         check("strict (nude) first, dressed after",
               [p["md5"] for p in r.candidates] == ["n1", "d0", "d1", "d2"])
 
-        booru.fetch_page, calls = fake_pages(pages2)
-        await booru.search(FakeSource(), ["t", "nude"], deque())
+        search.fetch_page, calls = fake_pages(pages2)
+        await search.search(FakeSource(), ["t", "nude"], deque())
         check("no nude phase when user already asked nude", all(c[0] == ("t", "nude") for c in calls))
 
-        booru.fetch_page, calls = fake_pages(pages2)
-        r = await booru.search(FakeSource(), ["t"], deque(), require_nudity=False)
+        search.fetch_page, calls = fake_pages(pages2)
+        r = await search.search(FakeSource(), ["t"], deque(), require_nudity=False)
         check("safe mode: no nude phase, dressed are candidates",
               all(c[0] == ("t",) for c in calls) and r.candidates[0]["md5"] == "d0")
 
@@ -289,46 +292,46 @@ async def search_tests():
         bad = {(("t",), 0): [{"md5": "l", "tags": "loli nude", "score": 9, "rating": "explicit"},
                              {"md5": "s", "tags": "nude", "score": 9, "rating": "safe"},
                              nude(1)]}
-        booru.fetch_page, _ = fake_pages(bad)
-        r = await booru.search(FakeSource(), ["t"], deque())
+        search.fetch_page, _ = fake_pages(bad)
+        r = await search.search(FakeSource(), ["t"], deque())
         check("blacklisted and wrong-rating posts dropped", [p["md5"] for p in r.candidates] == ["n1"])
 
-        async def broken(source, tags, page):
-            raise booru.SourceError("auth", "401")
-        booru.clear_search_cache()
+        async def broken(source, tags, page, cursor=None):
+            raise sources.SourceError("auth", "401")
+        search.clear_search_cache()
         FakeSource.name = 'Broken-' + str(time.monotonic_ns())
-        booru.fetch_page = broken
-        r = await booru.search(FakeSource(), ["t"], deque())
+        search.fetch_page = broken
+        r = await search.search(FakeSource(), ["t"], deque())
         check("source error reported, no candidates", r.errors == ["auth"] and not r.candidates and r.fetched == 0)
     finally:
-        booru.fetch_page = orig
+        search.fetch_page = orig
 
     print("== fetch_media ==")
     calls = []
-    orig_dl = booru.download
+    orig_dl = sources.download
 
     async def fake_dl(url, max_size, referer=""):
         calls.append(url)
         if "big" in url:
             return None, "too_big"
         return b"data", None
-    booru.download = fake_dl
+    sources.download = fake_dl
     try:
-        m, why = await booru.fetch_media(FakeSource(), {"file_url": "http://h/big.png",
+        m, why = await sources.fetch_media(FakeSource(), {"file_url": "http://h/big.png",
                                                         "jpeg_url": "http://h/ok.jpg"}, 100)
         check("too big original -> jpeg version", m is not None and m.reduced and m.ext == "jpg")
         calls.clear()
-        m, why = await booru.fetch_media(FakeSource(), {"file_url": "http://h/a.png", "file_size": 999,
+        m, why = await sources.fetch_media(FakeSource(), {"file_url": "http://h/a.png", "file_size": 999,
                                                         "sample_url": "http://h/s.jpg"}, 100)
         check("known file_size skips original without request", calls == ["http://h/s.jpg"])
-        m, why = await booru.fetch_media(FakeSource(), {"file_url": "http://h/v.mp4"}, 100)
+        m, why = await sources.fetch_media(FakeSource(), {"file_url": "http://h/v.mp4"}, 100)
         check("video detected", m.is_video and m.ext == "mp4")
-        m, why = await booru.fetch_media(FakeSource(), {"file_url": "http://h/big.mp4"}, 100)
+        m, why = await sources.fetch_media(FakeSource(), {"file_url": "http://h/big.mp4"}, 100)
         check("only too-big file -> too_big", m is None and why == "too_big")
-        m, why = await booru.fetch_media(FakeSource(), {"file_url": ""}, 100)
+        m, why = await sources.fetch_media(FakeSource(), {"file_url": ""}, 100)
         check("no url -> no_file", m is None and why == "no_file")
     finally:
-        booru.download = orig_dl
+        sources.download = orig_dl
 
     print("== send_first_fitting ==")
 
@@ -357,23 +360,23 @@ async def search_tests():
 
     fu = Followup(fail_first=True)
     cands = [{"md5": "a"}, {"md5": "b"}]
-    sent, reasons = await b.send_first_fitting(Inter(fu), "T|x", cands, payload_ok)
+    sent, reasons = await b.delivery.send_first_fitting(b.memory, Inter(fu), "T|x", cands, payload_ok)
     check("413 -> next candidate sent", sent["md5"] == "b" and fu.sent == [{"content": "b"}])
     check("sent art remembered", "b" in b.memory.recent("T|x"))
 
     reserved = b.memory.reserve("T|y", {"a"})
     fu = Followup()
-    sent, _ = await b.send_first_fitting(Inter(fu), "T|y", cands, payload_ok)
+    sent, _ = await b.delivery.send_first_fitting(b.memory, Inter(fu), "T|y", cands, payload_ok)
     check("in-flight art skipped (no double send)", sent["md5"] == "b")
     b.memory.release(reserved)
 
     async def payload_none(post):
         return None, "too_big"
     fu = Followup()
-    sent, reasons = await b.send_first_fitting(Inter(fu), "T|z", cands, payload_none)
+    sent, reasons = await b.delivery.send_first_fitting(b.memory, Inter(fu), "T|z", cands, payload_none)
     check("nothing fits -> None + reasons", sent is None and reasons == {"too_big"})
-    check("too_big text", "слишком большие" in b.nothing_sent_text("x", "G", reasons))
-    check("error text", "Не удалось скачать" in b.nothing_sent_text("x", "G", {"error"}))
+    check("too_big text", "слишком большие" in b.texts.nothing_sent("x", "G", reasons))
+    check("error text", "Не удалось скачать" in b.texts.nothing_sent("x", "G", {"error"}))
     check("failed downloads release pending", not b.memory._connection().execute(
         "SELECT 1 FROM shown WHERE scope='T|z' AND status='pending'").fetchone())
 
@@ -403,7 +406,15 @@ check("DM refused (no age gate)", b.channel_allows_nsfw(_ChanInter(None, _Chan(T
 check("channel without is_nsfw refused", b.channel_allows_nsfw(_ChanInter(1, object())) is False)
 
 b.memory.close()
-booru.clear_search_cache()
+search.clear_search_cache()
 _test_cache.cleanup()
 print(f"\n==== {passed} passed, {failed} failed ====")
-raise SystemExit(1 if failed else 0)
+
+
+class LogicChecks(__import__("unittest").TestCase):
+    def test_all_checks_pass(self):
+        self.assertEqual(failed, 0, "см. FAIL-строки выше")
+
+
+if __name__ == "__main__":
+    raise SystemExit(1 if failed else 0)

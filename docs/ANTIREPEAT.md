@@ -76,8 +76,7 @@ Telegram-альбомы проверяются по ID альбома и по б
 
    ```bash
    pip install -r requirements.txt
-   python test_bot.py
-   python -m unittest -v test_antirepeat
+   python -m unittest discover -s tests
    ```
 
 5. Запустить бот. Убедиться, что импорт старой истории прошёл без ошибок.

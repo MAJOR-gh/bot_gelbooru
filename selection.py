@@ -201,11 +201,6 @@ class ShownMemory:
             db.execute("INSERT OR IGNORE INTO shown VALUES (?,?,'sent',NULL,?)",
                        (scope, uid, time.time()))
 
-    def save(self) -> None:
-        # Compatibility: every mutation is already committed, no periodic JSON write.
-        if self._db is not None:
-            self._db.commit()
-
     def close(self) -> None:
         if self._db is not None:
             self._db.close()
