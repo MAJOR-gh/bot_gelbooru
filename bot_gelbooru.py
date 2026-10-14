@@ -11,6 +11,8 @@
   tg_source      — Telegram-каналы (userbot на Telethon).
 """
 import logging
+import asyncio
+import math
 import os
 import random
 import time
@@ -24,17 +26,20 @@ from nextcord.ext import commands
 import config  # noqa: F401  (первым: загружает .env)
 import content_filter as cf
 import delivery
+import diagnostics
 import search
+import tag_help
 import sources
 import texts
 import tg_source
 from selection import ShownMemory, channel_scope, order_candidates
+from search_ui import NextView
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
                     datefmt="%Y-%m-%d %H:%M:%S")
 logger = logging.getLogger("gelbooru_bot")
 
-VERSION = "3.3.0"
+VERSION = "3.4.0"
 KANZAKI_HIDERI_IMAGE = os.path.join(config.BASE_DIR, "assets", "kanzaki_hideri.jpg")
 
 memory = ShownMemory(os.path.join(config.data_dir(), "shown.sqlite3"),
@@ -75,6 +80,7 @@ COOLDOWNS = {
     "tg": CooldownManager(3, 30.0),
     "tags": CooldownManager(1, 30.0),
     "tagcheck": CooldownManager(5, 30.0),
+    "status": CooldownManager(1, 30.0),
 }
 
 
@@ -99,7 +105,7 @@ def channel_allows_nsfw(interaction) -> bool:
 
 async def defer_or_log(interaction, label: str) -> bool:
     try:
-        await interaction.response.defer()
+        await interaction.response.defer(with_message=True)
         return True
     except (NotFound, nextcord.HTTPException) as error:
         logger.warning("[%s] defer не удался: %s", label, error)
@@ -149,63 +155,108 @@ def empty_result_text(res: search.SearchResult, display_tag: str, site: str) -> 
         return texts.pagination_stopped(site, res.fetched)
     if res.allowed:
         return texts.ALL_SHOWN
+    if not res.fetched:
+        return texts.no_site_results(display_tag, site)
     return texts.nothing_found(display_tag, site)
+
+
+def next_view(interaction, raw_tags, source, cooldown, nsfw):
+    async def advance(next_interaction):
+        return await run_booru_search(next_interaction, raw_tags, source, cooldown, nsfw=nsfw)
+    return NextView(interaction.user.id, interaction.channel_id, advance)
 
 
 async def run_booru_search(interaction, raw_tags: tuple, source, cooldown: CooldownManager,
                            *, nsfw: bool = True):
     """Общая логика /gelbooru, /konachan, /safebooru (nsfw=False — без NSFW и наготы)."""
     if nsfw and not channel_allows_nsfw(interaction):
-        return await interaction.response.send_message(texts.NSFW_ONLY, ephemeral=True)
+        await interaction.response.send_message(texts.NSFW_ONLY, ephemeral=True)
+        return False
     tags = cf.clean_user_tags(raw_tags)
     if not tags:
-        return await interaction.response.send_message(texts.NO_TAGS, ephemeral=True)
+        await interaction.response.send_message(texts.NO_TAGS, ephemeral=True)
+        return False
     verdict = tag_verdict(tags)
     if verdict == "blocked":                 # тихо, только автору, без траты кулдауна
-        return await answer_verdict(interaction, verdict)
+        await answer_verdict(interaction, verdict)
+        return False
     if await reject_if_on_cooldown(interaction, cooldown):
-        return
+        return False
     if verdict:
-        return await answer_verdict(interaction, verdict)
+        await answer_verdict(interaction, verdict)
+        return False
     if not await defer_or_log(interaction, source.name):
-        return
+        return False
 
     display_tag = " + ".join(tags)
     scope = channel_scope(interaction)
     try:
-        res = await search.search(source, tags, memory.recent(scope), require_nudity=nsfw)
+        started = time.monotonic()
+        res = await search.search(source, tags, memory.search_history(scope), require_nudity=nsfw)
+        diagnostics.record_search(scope, source, res, (time.monotonic() - started) * 1000)
         if res.errors:
-            text = (texts.scan_pending(res.fetched, res.total) if "scan_pending" in res.errors
+            pending = "scan_pending" in res.errors
+            text = (texts.scan_pending(res.fetched, res.total, priority=res.priority_pending) if pending
                     else texts.source_error(source.name, res.errors))
-            return await interaction.followup.send(text)
+            kwargs = {"view": next_view(interaction, tuple(tags), source, cooldown, nsfw)} if pending else {}
+            message = await interaction.followup.send(text, **kwargs)
+            if pending:
+                kwargs["view"].message = message
+            return pending
         if not res.candidates:
-            return await interaction.followup.send(empty_result_text(res, display_tag, source.name))
+            message = empty_result_text(res, display_tag, source.name)
+            # Suggestions do not silently modify or broaden the original query.
+            if not res.fetched and res.complete and len(tags) == 1 and not tags[0].startswith("-"):
+                hints = await tag_help.suggestions(source, tags[0], nsfw=channel_allows_nsfw(interaction),
+                                                  limit=5)
+                hints = [h for h in hints if h != tags[0]]
+                if hints:
+                    message += "\n💡 Возможно, ты имел в виду: " + ", ".join(f"`{h}`" for h in hints)
+            await interaction.followup.send(message)
+            return True
         max_size = delivery.max_upload_size(interaction)
+        view = next_view(interaction, tuple(tags), source, cooldown, nsfw)
+        async def make_payload(post):
+            payload, reason = await delivery.build_booru_payload(source, post, display_tag, max_size)
+            if payload is not None:
+                payload["view"] = view
+            return payload, reason
         sent, reasons = await delivery.send_first_fitting(
-            memory, interaction, scope, res.candidates,
-            lambda p: delivery.build_booru_payload(source, p, display_tag, max_size))
+            memory, interaction, scope, res.candidates, make_payload)
         if sent is None:
-            await delivery.safe_followup(interaction, texts.nothing_sent(display_tag, source.name, reasons))
+            view.message = await delivery.safe_followup(
+                interaction, texts.nothing_sent(display_tag, source.name, reasons), view=view)
+        return True
     except NotFound:
         logger.warning("[%s] интеракция протухла", source.name)
     except Exception:
         logger.exception("[%s] ошибка поиска по `%s`", source.name, display_tag)
         await delivery.safe_followup(interaction, texts.INTERNAL_ERROR)
+    return False
 
 
 def register_booru_command(name: str, description: str, source, *, nsfw: bool = True):
     """Одна фабрика вместо трёх одинаковых команд /gelbooru, /konachan, /safebooru."""
     async def command(
         interaction: nextcord.Interaction,
-        tag: str = nextcord.SlashOption(description=texts.TAG_OPTION, required=True),
-        tag2: str = nextcord.SlashOption(description=texts.EXTRA_OPTION, required=False, default=None),
-        tag3: str = nextcord.SlashOption(description=texts.EXTRA_OPTION, required=False, default=None),
-        tag4: str = nextcord.SlashOption(description=texts.EXTRA_OPTION, required=False, default=None),
+        tag: str = nextcord.SlashOption(description=texts.TAG_OPTION, required=True, autocomplete=True),
+        tag2: str = nextcord.SlashOption(description=texts.EXTRA_OPTION, required=False, default=None,
+                                        autocomplete=True),
+        tag3: str = nextcord.SlashOption(description=texts.EXTRA_OPTION, required=False, default=None,
+                                        autocomplete=True),
+        tag4: str = nextcord.SlashOption(description=texts.EXTRA_OPTION, required=False, default=None,
+                                        autocomplete=True),
     ):
         await run_booru_search(interaction, (tag, tag2, tag3, tag4), source, COOLDOWNS[name], nsfw=nsfw)
 
     command.__name__ = name
-    return bot.slash_command(name=name, description=description)(command)
+    registered = bot.slash_command(name=name, description=description)(command)
+    async def autocomplete(interaction, value):
+        choices = await tag_help.suggestions(source, value, nsfw=channel_allows_nsfw(interaction))
+        await interaction.response.send_autocomplete(choices)
+    for option in ("tag", "tag2", "tag3", "tag4"):
+        registered.on_autocomplete(option)(autocomplete)
+    return registered
 
 
 register_booru_command("gelbooru", "🔞 Арт по тегам с Gelbooru — приоритет твоему запросу (до 4 тегов)", GELBOORU)
@@ -252,7 +303,8 @@ async def tags_list(interaction: nextcord.Interaction):
 # ── /tagcheck ─────────────────────────────────────────────────────────────────
 @bot.slash_command(name="tagcheck", description="🔍 Проверить, есть ли на Gelbooru арты по тегу")
 async def tag_check(interaction: nextcord.Interaction,
-                    tag: str = nextcord.SlashOption(description="Тег для проверки", required=True)):
+                    tag: str = nextcord.SlashOption(description="Тег для проверки", required=True,
+                                                    autocomplete=True)):
     if not channel_allows_nsfw(interaction):
         return await interaction.response.send_message(texts.NSFW_ONLY, ephemeral=True)
     cleaned = cf.clean_user_tags([tag])
@@ -275,6 +327,9 @@ async def tag_check(interaction: nextcord.Interaction,
             similar = [t for t in await GELBOORU.similar_tags(part, 8)
                        if t.get("name") != clean_tag and int(t.get("count") or 0) > 0
                        and not cf.tag_is_blocked(t["name"])][:5]
+            if not similar:
+                hints = await tag_help.suggestions(GELBOORU, clean_tag, nsfw=True, limit=5)
+                similar = [{"name": name, "count": None} for name in hints if name != clean_tag]
     except sources.SourceError as error:
         return await delivery.safe_followup(interaction, texts.source_error("Gelbooru", [error.kind]))
 
@@ -291,12 +346,50 @@ async def tag_check(interaction: nextcord.Interaction,
                                description="На Gelbooru нет артов с таким тегом.", color=0xe74c3c)
     if similar:
         embed.add_field(name="🔎 Похожие теги", inline=False, value="\n".join(
-            f"`{t['name']}` — {texts.short_count(int(t.get('count') or 0))}" for t in similar))
+            f"`{t['name']}`" + (f" — {texts.short_count(int(t['count']))}"
+                               if t.get("count") is not None else " — вариант написания")
+            for t in similar))
     elif count == 0:
         embed.add_field(name="💡 Попробуй", inline=False,
                         value="• Проверь написание (теги на английском, через `_`)\n• Посмотри `/tags`")
     await delivery.safe_followup(interaction, embed=embed)
 
+
+@tag_check.on_autocomplete("tag")
+async def tag_check_autocomplete(interaction, value):
+    choices = await tag_help.suggestions(GELBOORU, value, nsfw=channel_allows_nsfw(interaction))
+    await interaction.response.send_autocomplete(choices)
+
+
+@bot.slash_command(name="status", description="🩺 Состояние бота, API и последнего поиска")
+async def status_command(interaction: nextcord.Interaction):
+    if await reject_if_on_cooldown(interaction, COOLDOWNS["status"]):
+        return
+    await interaction.response.defer(ephemeral=True, with_message=True)
+    health = await asyncio.gather(*(diagnostics.probe(s) for s in (GELBOORU, KONACHAN, SAFEBOORU)))
+    embed = nextcord.Embed(title=f"🩺 Бот v{VERSION}", color=0x3498db)
+    uptime = max(0, int(time.monotonic() - diagnostics.STARTED))
+    latency = bot.latency
+    ping = f"{latency * 1000:.0f} мс" if math.isfinite(latency) else "ещё не измерена"
+    embed.add_field(name="Discord", value=f"Задержка: {ping} · работает {uptime // 60} мин", inline=False)
+    for source, result in zip((GELBOORU, KONACHAN, SAFEBOORU), health):
+        embed.add_field(name=source.name, value=diagnostics.health_text(result), inline=False)
+    embed.add_field(name="Кэш в памяти",
+                    value=f"Страниц: {len(sources._page_cache)} · индексов: {len(search._scans)}",
+                    inline=False)
+    last = diagnostics.last_search(channel_scope(interaction))
+    if last:
+        result = ("приоритет ещё проверяется" if last["pending"] else
+                  "порядок подтверждён" if last["proven"] else "частичная выдача")
+        value = (f'{last["site"]} · {last["elapsed_ms"]:.0f} мс\n'
+                 f'Просмотрено: {last["fetched"]:,} · после фильтров: {last["allowed"]:,}\n{result}')
+        if last["errors"]:
+            value += "\nСостояние: " + ", ".join(last["errors"])
+    else:
+        value = "После запуска в этом канале ещё не искали."
+    embed.add_field(name="Последний booru-поиск в этом канале", value=value, inline=False)
+    embed.set_footer(text="API-проверки кэшируются на 60 с. Успешный API не гарантирует доставку файла.")
+    await delivery.safe_followup(interaction, embed=embed, ephemeral=True)
 
 # ── /tg — арты из Telegram-каналов ────────────────────────────────────────────
 async def run_tg_search(interaction, alias: str | None):

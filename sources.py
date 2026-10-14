@@ -126,7 +126,13 @@ def parse_tag_list(text: str) -> list[dict]:
     try:
         data = json.loads(text)
     except (json.JSONDecodeError, TypeError):
-        return []
+        try:
+            root = ET.fromstring(text)
+        except (ET.ParseError, TypeError):
+            return []
+        if root.tag != "tags":
+            return []
+        return [dict(t.attrib) for t in root.findall("tag") if t.get("name")]
     tags = data.get("tag", []) if isinstance(data, dict) else data
     if isinstance(tags, dict):
         tags = [tags]
@@ -212,6 +218,18 @@ class DapiSource(Source):
     def post_url(self, post):
         return f"{self.URL}?page=post&s=view&id={post.get('id')}"
 
+    async def tag_info(self, names: list[str]) -> dict[str, dict]:
+        async with _limiter(self):
+            text = await fetch_text(self.URL, self.params(s="tag", limit="100", names=" ".join(names)))
+        return {t["name"]: t for t in parse_tag_list(text) if t.get("name")}
+
+    async def similar_tags(self, part: str, limit: int = 5, *, retries: int = 2) -> list[dict]:
+        async with _limiter(self):
+            text = await fetch_text(self.URL, self.params(
+                s="tag", limit=str(limit), orderby="count", order="DESC", name_pattern=f"%{part}%"),
+                retries=retries)
+        return parse_tag_list(text)
+
 
 class Gelbooru(DapiSource):
     name = "Gelbooru"
@@ -232,17 +250,6 @@ class Gelbooru(DapiSource):
 
     def normalize(self, post):
         return slim(post, rating=(post.get("rating") or "").lower(), _site=self.name)
-
-    async def tag_info(self, names: list[str]) -> dict[str, dict]:
-        """Инфо о тегах одним запросом: {имя: {"count": int, "type": int}}."""
-        text = await fetch_text(self.URL, self.params(s="tag", limit="100", names=" ".join(names)))
-        return {t["name"]: t for t in parse_tag_list(text) if t.get("name")}
-
-    async def similar_tags(self, part: str, limit: int = 5) -> list[dict]:
-        """Самые популярные теги, содержащие part (подсказка при опечатке)."""
-        text = await fetch_text(self.URL, self.params(
-            s="tag", limit=str(limit), orderby="count", order="DESC", name_pattern=f"%{part}%"))
-        return parse_tag_list(text)
 
 
 class Safebooru(DapiSource):

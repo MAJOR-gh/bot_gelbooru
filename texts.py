@@ -43,10 +43,12 @@ VENTI_WARNING = (
 
 
 # ── Результаты поиска ─────────────────────────────────────────────────────────
-def scan_pending(fetched: int, total: int | None) -> str:
+def scan_pending(fetched: int, total: int | None, *, priority: bool = False) -> str:
     of_total = f" из примерно {total:,}" if total is not None else ""
-    return (f"⏳ Пока не найдено новых подходящих артов: просмотрено {fetched:,}{of_total} постов. "
-            "Повтори запрос — продолжу со следующей страницы. Повторы запрещены.")
+    reason = ("Приоритет ещё не подтверждён — менее подходящий арт не подставляю."
+              if priority else "Пока не найдено новых подходящих артов.")
+    return (f"⏳ {reason} Просмотрено {fetched:,}{of_total} постов. "
+            "Нажми Next — продолжу со следующей страницы. Повторы запрещены.")
 
 
 def pagination_stopped(site: str, fetched: int) -> str:
@@ -61,6 +63,11 @@ TG_ALL_SHOWN = "✅ В просмотренной истории Telegram нет
 
 def nothing_found(display_tag: str, site: str) -> str:
     return f"❌ По тегу `{display_tag}` на {site} ничего не найдено после фильтров."
+
+
+def no_site_results(display_tag: str, site: str) -> str:
+    return (f"❌ {site} вернул пустую выдачу по `{display_tag}` (с учётом исключений запроса). "
+            "Проверь написание, сочетание тегов или убери часть исключений.")
 
 
 def nothing_sent(display_tag: str, label: str, reasons: set[str]) -> str:
@@ -116,5 +123,7 @@ HELP_COMMANDS = [
     ("🏷️ /tags", "Популярные теги и сколько по ним артов"),
     ("🔍 /tagcheck <тег>", "Проверить тег и подсказать похожие, если опечатка"),
     ("📖 /help", "Показать эту справку"),
+    ("🩺 /status", "Состояние API, задержка, кэш и последний поиск в этом канале"),
 ]
-HELP_FOOTER = "💡 NSFW-команды работают только в NSFW-каналах. Тег с минусом (-tag) исключает его."
+HELP_FOOTER = ("💡 Next продолжает тот же запрос без повторов (10 минут, только автор). "
+               "Теги подсказываются при вводе; -tag исключает тег.")
