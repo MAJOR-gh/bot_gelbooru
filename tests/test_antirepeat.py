@@ -682,7 +682,9 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
             await bot.run_booru_search(interaction, ('1girl',), self.source, bot.CooldownManager(5, 30))
         interaction.response.defer.assert_awaited_once()
         self.assertEqual(calls, [0])
-        self.assertEqual(interaction.followup.sent, [{'content': 'new-art-0'}])
+        self.assertEqual(len(interaction.followup.sent), 1)
+        self.assertEqual(interaction.followup.sent[0]['content'], 'new-art-0')
+        self.assertEqual(interaction.followup.sent[0]['view'].next_button.label, 'Next')
         self.assertIn('image-0', bot.memory.recent(self.scope))
 
 

@@ -11,11 +11,21 @@ import sqlite3
 import time
 import uuid
 from collections.abc import Iterable
+from dataclasses import dataclass
+from pathlib import Path
 
 from content_filter import focus_tier
 
 logger = logging.getLogger('gelbooru_bot.selection')
 LEGACY_SCOPE = '__legacy_all_channels__'
+
+
+@dataclass(frozen=True)
+class HistoryView:
+    """Read-only SQL reference; avoids copying the whole channel per search."""
+    uri: str
+    scope: str
+    legacy_scope: str = LEGACY_SCOPE
 
 
 def post_score(post: dict) -> int:
@@ -163,6 +173,12 @@ class ShownMemory:
         except BaseException:
             db.rollback()
             raise
+
+    def search_history(self, scope: str) -> HistoryView | set[str]:
+        self._connection()
+        if self.path == ':memory:':
+            return self.recent(scope)
+        return HistoryView(Path(self.path).resolve().as_uri() + '?mode=ro', scope)
 
     def reserve(self, scope: str, uids: Iterable[str]) -> str | None:
         token = uuid.uuid4().hex

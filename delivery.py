@@ -57,7 +57,7 @@ async def safe_followup(interaction, content=None, **kwargs):
 def _send_kwargs(payload: dict) -> dict:
     """payload → аргументы followup.send без пустых и служебных полей."""
     out = {k: payload[k] for k in ("content", "files") if payload.get(k)}
-    out.update({k: payload[k] for k in ("embed", "file") if payload.get(k) is not None})
+    out.update({k: payload[k] for k in ("embed", "file", "view") if payload.get(k) is not None})
     return out
 
 
@@ -99,7 +99,9 @@ async def send_first_fitting(memory: ShownMemory, interaction, scope: str, candi
                         continue
                     delivery_started = True
                     try:
-                        await interaction.followup.send(**_send_kwargs(payload))
+                        message = await interaction.followup.send(**_send_kwargs(payload))
+                        if payload.get("view") is not None:
+                            payload["view"].message = message
                     except nextcord.HTTPException as error:
                         if error.status < 500:
                             delivery_started = False   # явный отказ — не «неясная доставка»

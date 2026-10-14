@@ -51,6 +51,8 @@ class SearchResult:
     complete: bool = False
     allowed: int = 0
     stop_reason: str | None = None
+    ranking_proven: bool = False
+    priority_pending: bool = False
 
 
 _PERSISTED = ("next_page", "page_size", "total", "fetched", "complete", "stop_reason",
@@ -259,6 +261,20 @@ async def search(source: Source, tags: list[str], recent, *,
         errors = ["scan_pending"]
     except SourceError as error:
         errors = [error.kind]
+    groups = cf.focus_groups_for(tags)
+    best_tier = cf.TOP_TIER if groups else 0
+    proven = (state.complete and state.stop_reason == "api_end") or (
+        state.frontier is not None
+        and candidates.proven_count(best_tier, state.frontier, NEED_FRESH) >= NEED_FRESH)
+    priority_unproven = bool(groups and not proven and not exhaustive)
+    priority_pending = priority_unproven and not state.complete
+    if priority_unproven:
+        # The page/time budget is never evidence that the priority is optimal.
+        candidates = []
+        if not errors:
+            errors = ["scan_pending" if priority_pending else "incomplete"]
+    elif groups and proven and not state.complete and not exhaustive:
+        candidates.restrict_to_proven(best_tier, state.frontier)
     if exhaustive:
         if state.stop_reason in {"api_end_before_count", "repeated_page"}:
             errors = ["incomplete"]
@@ -272,4 +288,4 @@ async def search(source: Source, tags: list[str], recent, *,
         errors = ["scan_pending"]
     return SearchResult(candidates, errors, state.fetched, state.total,
                         state.complete and state.stop_reason == "api_end",
-                        state.allowed, state.stop_reason)
+                        state.allowed, state.stop_reason, proven, priority_pending)
