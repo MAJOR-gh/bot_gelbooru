@@ -39,7 +39,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(na
                     datefmt="%Y-%m-%d %H:%M:%S")
 logger = logging.getLogger("gelbooru_bot")
 
-VERSION = "3.4.0"
+VERSION = "3.4.1"
 KANZAKI_HIDERI_IMAGE = os.path.join(config.BASE_DIR, "assets", "kanzaki_hideri.jpg")
 
 memory = ShownMemory(os.path.join(config.data_dir(), "shown.sqlite3"),
@@ -266,7 +266,7 @@ register_booru_command("safebooru", "🟢 Safe-арт по тегам с Safeboo
 
 
 # ── /tags ─────────────────────────────────────────────────────────────────────
-# Только живые теги Gelbooru (1boy/hetero убраны — такие арты режет HARD-блок).
+# Подборка популярных тегов; разрешённый 1boy не навязывается каждому запросу.
 POPULAR_TAGS = [
     "1girl", "solo", "2girls", "multiple_girls",
     "breasts", "ass", "nude", "censored", "uncensored", "bikini", "school_uniform",
