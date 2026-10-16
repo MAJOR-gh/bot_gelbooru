@@ -1,7 +1,7 @@
 """Контент-политика бота: что показываем, что режем, что считаем «наготой».
 
 Все списки тегов живут здесь — блэклисты правятся в одном месте.
-Чистые функции без сети и Discord, покрыты test_bot.py.
+Чистые функции без сети и Discord, покрыты tests/test_logic.py и tests/test_content_policy.py.
 """
 
 # ── Общий блэклист (точное совпадение тега поста) ──────────────────────────────
@@ -56,14 +56,17 @@ AI_SUBSTRINGS = ("ai-generated", "ai_generated", "ai-created", "ai_art",
                  "stable_diffusion", "novelai", "nai_diffusion", "midjourney",
                  "dall-e", "dalle")
 
-# ── HARD-блок: яой / мужской контент / фембои / бондаж / БДСМ ──────────────────
+# ── HARD-блок: яой / male-focus / фембои / бондаж / БДСМ ──────────────────────
 # Строго запрещено и НЕотключаемо, даже если юзер укажет такой тег явно.
+# 1boy — только число персонажей, НЕ признак яоя/фембоев. Не исключаем его:
+# иначе пропадут и смешанные сцены 1girl + 1boy. Обязательный hetero не добавляем:
+# это необоснованно сузило бы выдачу и отрезало solo-арты.
 HARD_TAGS = [
-    # яой / мужской контент
+    # яой / контент с мужским фокусом (не любой кадр с мужчиной)
     "yaoi", "bara", "gay", "male_only", "multiple_boys", "2boys", "3boys",
-    "male/male", "boy_on_top", "male_focus", "1boy", "cum_on_male",
+    "male/male", "boy_on_top", "male_focus", "cum_on_male",
     # фембои / трапы / переодевание
-    "femboy", "trap", "crossdressing", "otoko_no_ko", "cuntboy", "tomgirl",
+    "femboy", "trap", "crossdressing", "otoko_no_ko", "otokonoko", "cuntboy", "tomgirl",
     "astolfo_(fate)", "astolfo", "felix_argyle",
     # футанари
     "futanari", "futa", "futa_on_male", "newhalf", "dickgirl",
@@ -79,8 +82,8 @@ HARD_SET = frozenset(HARD_TAGS)
 # каждым словом тега ТОЧНО (futa ≠ futaba_sakura), фраза из нескольких слов —
 # подстрокой.
 HARD_SUBSTRINGS = (
-    "yaoi", "bara", "femboy", "futanari", "futa", "crossdress",
-    "otoko_no_ko", "cuntboy", "bondage", "bdsm", "shibari", "_gag", "gag_",
+    "yaoi", "bara", "femboy", "futanari", "futa", "crossdress", "crossdressing",
+    "otoko_no_ko", "otokonoko", "cuntboy", "bondage", "bdsm", "shibari", "_gag", "gag_",
     "ball_gag", "ring_gag", "leash", "shackle", "ryona",
     "strap-on", "strapon",
 )
