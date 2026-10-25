@@ -92,6 +92,54 @@ class ContentPolicyTests(unittest.TestCase):
                 self.assertTrue(cf.post_is_clean({"tags": f"1girl nude {tag}"}))
                 self.assertFalse(cf.tag_is_blocked(tag))
 
+    def test_extreme_tags_found_by_gelbooru_audit_are_blocked(self):
+        for tag in ("incest", "interspecies", "stomach_bulge", "cervical_penetration", "gaping",
+                    "humiliation", "hypnosis", "somnophilia", "sleep_molestation", "scat", "guro",
+                    "necrophilia", "amputee", "vomiting", "prolapse", "anal_prolapse",
+                    "nipple_penetration", "urethral_insertion", "sounding", "egg_laying",
+                    "oviposition", "enema", "omorashi", "mind_break", "spanked"):
+            with self.subTest(tag=tag):
+                self.assertFalse(cf.post_is_clean({"tags": f"1girl nude {tag}"}))
+                self.assertTrue(cf.tag_is_blocked(tag))
+                self.assertFalse(cf.tag_is_blocked("-" + tag))   # исключать можно всегда
+
+    def test_toys_dildo_and_vibrator_allowed_insertions_blocked(self):
+        self.assertTrue(cf.post_is_clean({"tags": "1girl nude dildo sex_toy"}))
+        self.assertTrue(cf.post_is_clean({"tags": "1girl nude vibrator sex_toy"}))
+        for tag in ("dildo", "vibrator", "sex_toy"):
+            self.assertFalse(cf.tag_is_blocked(tag))
+        for tag in ("object_insertion", "anal_object_insertion", "anal_fingering"):
+            with self.subTest(tag=tag):
+                self.assertFalse(cf.post_is_clean({"tags": f"1girl nude sex_toy {tag}"}))
+                self.assertTrue(cf.tag_is_blocked(tag))
+
+    def test_pokemon_trainers_allowed_creatures_blocked(self):
+        self.assertTrue(cf.post_is_clean({"tags": "1girl nude pokemon nessa_(pokemon)"}))
+        self.assertFalse(cf.tag_is_blocked("pokemon"))
+        for tag in ("pokemon_(creature)", "pokephilia", "pikachu"):
+            with self.subTest(tag=tag):
+                self.assertFalse(cf.post_is_clean({"tags": f"1girl nude pokemon {tag}"}))
+
+    def test_gaping_no_longer_raises_pussy_focus(self):
+        groups = cf.focus_groups_for(["pussy"])
+        self.assertNotIn("gaping", cf.FOCUS_GROUPS["pussy"]["focus"])
+        self.assertEqual(cf.focus_tier({"tags": "1girl nude gaping"}, groups), 1)
+
+    def test_hololive_is_not_an_age_tag_but_real_age_tags_still_block(self):
+        # «ho-loli-ve»: корень попал в название случайно — вся Hololive терялась.
+        for tags in ("1girl nude hololive", "1girl nude hololive_english"):
+            with self.subTest(tags=tags):
+                self.assertTrue(cf.post_is_clean({"tags": tags}))
+        self.assertFalse(cf.tag_is_blocked("hololive"))
+        # Настоящие возрастные теги рядом с hololive и внутри составных — блок.
+        for tags in ("1girl nude hololive loli", "nude hololive_loli", "nude loli_(hololive)",
+                     "nude hololive aged_down", "nude hololive child"):
+            with self.subTest(tags=tags):
+                self.assertFalse(cf.post_is_clean({"tags": tags}))
+        for tag in ("hololive_loli", "loli_hololive", "hololivelolicon"):
+            with self.subTest(tag=tag):
+                self.assertTrue(cf.tag_is_blocked(tag))
+
     def test_age_ai_and_rating_guards_are_unchanged(self):
         for forbidden in ("child", "aged-down", "ai-generated"):
             with self.subTest(tag=forbidden):

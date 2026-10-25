@@ -1,4 +1,4 @@
-# Gelbooru Discord Bot (v3.4.2)
+# Gelbooru Discord Bot (v3.4.3)
 
 Discord-бот на `nextcord`: ищет арты по тегам на booru-сайтах и в
 Telegram-каналах и присылает картинки / GIF / видео. Показывает лучший по

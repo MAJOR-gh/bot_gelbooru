@@ -14,14 +14,16 @@ BLACKLIST_TAGS = [
     "fart", "toilet", "diaper", "pregnancy", "pregnant", "birth", "group_sex",
     "furry", "anthro", "animal", "dog", "cat", "horse", "fox",
     "the_simpsons", "bart_simpson", "homer_simpson",
-    "pokemon", "pikachu", "my_little_pony", "mlp", "steven_universe",
+    # Pokemon: режем только самих существ — девушки-тренеры остаются.
+    "pokemon_(creature)", "pokephilia", "pikachu", "my_little_pony", "mlp", "steven_universe",
     "family_guy", "south_park", "rugrats", "disney", "cartoon",
     "3d",
     "futa", "futanari", "trap", "crossdressing", "femboy",
     "netorare", "ntr", "cheating", "cuckold",
-    "mindbreak", "mind_control",
-    "ryona", "bdsm", "bondage", "gag", "dildo",
-    "penetration", "anal_object_insertion", "anal_fingering", "anal_fisting",
+    "mindbreak", "mind_break", "mind_control",
+    # dildo/vibrator/sex_toy разрешены (sex_toy стоит на ~100% постов с ними).
+    "ryona", "bdsm", "bondage", "gag",
+    "penetration", "object_insertion", "anal_object_insertion", "anal_fingering", "anal_fisting",
     "foot_focus", "goblin",
     "ai_generated",
     "armpit_hair", "pubic_hair", "body_hair", "chest_hair", "leg_hair", "hairy",
@@ -36,6 +38,12 @@ BLACKLIST_TAGS = [
     "cuntboy", "gay", "lesbian", "dark-skinned_male",
     "male/male",
     "orc",
+    # ── извращения, которые проходили фильтр (аудит топа Gelbooru) ──
+    "incest", "interspecies", "stomach_bulge", "cervical_penetration", "gaping",
+    "humiliation", "hypnosis", "somnophilia", "sleep_molestation",
+    "scat", "guro", "necrophilia", "amputee", "vomiting",
+    "prolapse", "anal_prolapse", "nipple_penetration", "urethral_insertion", "sounding",
+    "egg_laying", "oviposition", "enema", "omorashi",
     # ── низкое качество / трешак (локальный отсев, не навязывает типаж) ──
     "lowres", "sketch", "wip", "unfinished", "jpeg_artifacts",
     "bad_proportions", "poorly_drawn", "scan", "what",
@@ -48,6 +56,9 @@ CRITICAL_TAGS = [
     "loli", "shota", "lolicon", "shotacon", "toddlercon",
     "underage", "child", "aged_down", "young",
 ]
+# Слова, внутри которых возрастной корень оказался случайно («ho-loli-ve»).
+# Перед проверкой вырезается ТОЛЬКО само слово: «hololive_loli» по-прежнему блок.
+AGE_SAFE_WORDS = ("hololive",)
 
 # ── AI / нейроарты — ловим подстрокой ─────────────────────────────────────────
 # Основной тег Gelbooru пишется через ДЕФИС ("ai-generated").
@@ -72,8 +83,8 @@ HARD_TAGS = [
     "futanari", "futa", "futa_on_male", "newhalf", "dickgirl",
     # бондаж / БДСМ / насилие в кадре
     "bdsm", "bondage", "shibari", "rope_bondage", "gag", "ball_gag",
-    "ring_gag", "tape_gag", "collar", "leash", "chained", "shackles",
-    "spanking", "whip", "flogger", "torture", "ryona",
+    "ring_gag", "tape_gag", "leash", "chained", "shackles",
+    "spanking", "spanked", "whip", "flogger", "torture", "ryona",
     # страпон / пеггинг
     "strap-on", "strapon",
 ]
@@ -103,6 +114,15 @@ _HARD_PHRASES = tuple(p for p in _HARD_PARTS if "_" in p)
 SERVER_EXCLUDES: list[str] = list(dict.fromkeys(
     f"-{t}" for t in CRITICAL_TAGS + AI_TAGS + HARD_TAGS
 ))
+
+
+def _has_age_marker(tag: str) -> bool:
+    """Возрастной корень где угодно в теге (дефис = подчёркивание), кроме AGE_SAFE_WORDS."""
+    low = tag.lower()
+    for word in AGE_SAFE_WORDS:
+        low = low.replace(word, " ")
+    n = _norm(low)
+    return any(c in low or c in n for c in CRITICAL_TAGS)
 
 
 def _is_hard_variant(tag_norm: str) -> bool:
@@ -170,7 +190,7 @@ FOCUS_GROUPS: dict[str, dict[str, frozenset]] = {
         "triggers": frozenset({"pussy", "vagina", "vaginal", "spread_pussy", "clitoris",
                                "cameltoe"}),
         "focus": frozenset({"spread_pussy", "pussy_focus", "clitoris", "pussy_juice",
-                            "cameltoe", "female_ejaculation", "after_vaginal", "gaping"}),
+                            "cameltoe", "female_ejaculation", "after_vaginal"}),
         "nudity": frozenset({"pussy", "cameltoe"}),
     },
     "feet": {
@@ -246,7 +266,7 @@ def post_is_allowed(post: dict, allowed_ratings: frozenset | None = None) -> boo
         n = _norm(tag)
         if _is_hard_variant(n):
             return False
-        if any(c in tag or c in n for c in CRITICAL_TAGS):   # n: «aged-down» = «aged_down»
+        if _has_age_marker(tag):
             return False
         if any(a in tag for a in AI_SUBSTRINGS):
             return False
@@ -306,11 +326,11 @@ def tag_is_blocked(tag: str) -> bool:
     if low in BLOCKED_USER_TAGS or not words.isdisjoint(BLOCKED_USER_TAGS):
         return True
     # Общий блэклист и HARD — точное совпадение (без деления на слова, чтобы не
-    # ловить cat_ears/animal_ears). Иначе запрос «collar» уходил бы к API вместе
-    # с «-collar» и молча возвращал пустоту.
+    # ловить cat_ears/animal_ears). Иначе запрос «leash» уходил бы к API вместе
+    # с «-leash» и молча возвращал пустоту.
     if low in BLACKLIST_SET or low in HARD_SET:
         return True
-    if any(c in low or c in n for c in CRITICAL_TAGS):
+    if _has_age_marker(low):
         return True
     if any(a in low for a in AI_SUBSTRINGS):
         return True

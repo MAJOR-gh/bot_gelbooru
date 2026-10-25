@@ -1,5 +1,26 @@
 # Changelog
 
+## v3.4.3 — блэклист по аудиту топа Gelbooru
+
+Проверено на живой выдаче: 1901 лучший пост по 11 частым запросам, только метаданные.
+
+- **Hololive снова ищется.** Возрастная проверка ловит корень `loli` подстрокой, а он
+  случайно сидит внутри «ho·loli·ve» — терялись все посты агентства (271 из 271 в топе).
+  Вырезается только само слово `hololive`: `hololive_loli`, `loli_(hololive)` и обычный
+  `loli` рядом по-прежнему блокируются. Остальная возрастная защита не менялась.
+- **В блок** то, что проходило фильтр: `incest`, `interspecies`, `stomach_bulge`,
+  `cervical_penetration`, `gaping`, `humiliation`, `hypnosis`, `somnophilia`,
+  `sleep_molestation`, `scat`, `guro`, `necrophilia`, `amputee`, `vomiting`, `prolapse`,
+  `anal_prolapse`, `nipple_penetration`, `urethral_insertion`, `sounding`, `egg_laying`,
+  `oviposition`, `enema`, `omorashi`, `object_insertion`, а также варианты написания уже
+  заблокированного: `mind_break`, `spanked`.
+- `gaping` убран из фокус-группы `pussy` — раньше он поднимал такие посты наверх.
+- **Разрешены**: `collar` (обычный ошейник/чокер), `dildo` (вместе с `vibrator` и
+  `sex_toy`, который стоит на ~100% таких постов), девушки-тренеры из Pokemon —
+  вместо всей франшизы режутся только `pokemon_(creature)` и `pokephilia`.
+- Индексы поиска пересоберутся один раз (меняется хеш контент-политики), история
+  показов не затрагивается.
+
 ## v3.4.2 — быстрее при сбоях CDN и в /tg, безопасность, чистка
 
 - ⚡ Зависший CDN больше не держит запрос ~40 секунд на каждом посте: молчание
