@@ -6,10 +6,6 @@
 # Логи
 *.log
 
-# Рантайм-состояние (память показанных артов)
-recent_shown.json
-recent_shown.json.tmp
-
 # Python
 __pycache__/
 *.pyc
@@ -22,13 +18,9 @@ venv/
 # Старые черновики с зашитыми токенами
 файлы губштейна/
 
-# Локальные данные
+# Рабочие данные: история показов, индексы поиска, старая история
 data/
-
-# SQLite history and disposable search indexes (never ship runtime data)
 shown.sqlite3*
-.search-index-*
-tg_found_channels.json
-tools/tg_found_channels.json
-
 search_cache/
+recent_shown.json
+tools/tg_found_channels.json

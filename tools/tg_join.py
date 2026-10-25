@@ -1,6 +1,6 @@
 """Вступить в каналы под твинком по инвайт-ссылкам (одноразово).
 
-python tg_join.py
+python tools/tg_join.py   (из корня бота — там лежит tg_userbot.session)
 Вставляй ссылки по одной: приватные t.me/+xxxx (или t.me/joinchat/xxxx)
 либо публичные @username / t.me/username. Пустая строка — выход.
 """

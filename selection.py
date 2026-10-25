@@ -22,7 +22,7 @@ LEGACY_SCOPE = '__legacy_all_channels__'
 
 @dataclass(frozen=True)
 class HistoryView:
-    """Read-only SQL reference; avoids copying the whole channel per search."""
+    """Ссылка на историю для read-only SQL — без копирования всего канала на каждый поиск."""
     uri: str
     scope: str
     legacy_scope: str = LEGACY_SCOPE
@@ -123,8 +123,8 @@ class ShownMemory:
             ''')
             if self.legacy_path and not db.execute(
                     "SELECT 1 FROM metadata WHERE key='legacy_imported'").fetchone():
-                # No channel information exists in the old JSON. Conservatively
-                # block its known IDs in every channel; NEVER silently drop history.
+                # В старом JSON нет каналов: его ID запрещаем во всех каналах сразу.
+                # Молча выбрасывать историю нельзя.
                 if os.path.exists(self.legacy_path):
                     with open(self.legacy_path, encoding='utf-8') as f:
                         data = json.load(f)
@@ -193,7 +193,7 @@ class ShownMemory:
             db.execute("UPDATE shown SET status='sent',token=NULL WHERE token=?", (token,))
 
     def mark_blocked(self, token: str) -> None:
-        # Different post IDs may refer to bytes already sent/reserved elsewhere.
+        """Байты файла уже отправлены/зарезервированы под другим ID — пост не показывать."""
         db = self._connection()
         with db:
             db.execute("UPDATE shown SET status='blocked',token=NULL WHERE token=?", (token,))

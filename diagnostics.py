@@ -1,4 +1,4 @@
-"""Sanitized /status metrics and bounded, cached API checks (never reveal credentials)."""
+"""Метрики для /status и кэшируемые проверки API (без ключей, URL и прокси в выводе)."""
 import asyncio
 import time
 from collections import OrderedDict
@@ -33,8 +33,8 @@ async def probe(source) -> Health:
         state = "ok"
         try:
             async with asyncio.timeout(PROBE_TIMEOUT):
-                # Safebooru answers an empty body for id:0; use a known benign tag.
-                # Only metadata is fetched, never images.
+                # На id:0 Safebooru отвечает пустым телом — берём безобидный тег.
+                # Качаются только метаданные, не картинки.
                 url, params = source.request(["scenery"], 0)
                 params["limit"] = "1"
                 async with sources._limiter(source):
@@ -42,7 +42,7 @@ async def probe(source) -> Health:
                 rows, _count = sources.parse_posts_page(text)
                 sources._validate(rows, text)
         except sources.SourceError as error:
-            state = error.kind  # raw errors/URLs can contain sensitive connection data
+            state = error.kind  # сырой текст ошибки может содержать URL с ключами
         except TimeoutError:
             state = "timeout"
         except Exception:

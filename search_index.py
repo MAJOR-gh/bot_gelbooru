@@ -151,7 +151,7 @@ class Candidates(Sequence):
             self.exclusion_params = (self.request,)
 
     def restrict_to_proven(self, tier: int, min_score: int):
-        """Never fall back to an unproven tier after a download failure."""
+        """Только доказанно лучшие: сбой скачивания не откатывает к недоказанному тиру."""
         self.rank_filter = 'AND p.strict=1 AND p.tier>=? AND p.score>=?'
         self.rank_params = (tier, min_score)
 

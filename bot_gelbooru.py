@@ -1,17 +1,9 @@
-"""Gelbooru Discord-бот: /gelbooru /konachan /safebooru /tg /tags /tagcheck /help.
+"""Gelbooru Discord-бот: точка входа, слэш-команды, кулдауны, события.
 
-Модули:
-  config         — все настройки из окружения / .env;
-  content_filter — что можно показывать (блэклисты, нагота, фокус части тела);
-  sources        — сайты: запросы, разбор ответов, скачивание;
-  search         — обход всей выдачи и ранжирование;
-  selection      — строгий анти-повтор (SQLite-история канала);
-  delivery       — скачивание и отправка в Discord;
-  texts          — все тексты для пользователя;
-  tg_source      — Telegram-каналы (userbot на Telethon).
+Карта модулей — в README.md (раздел «Структура»).
 """
-import logging
 import asyncio
+import logging
 import math
 import os
 import random
@@ -23,23 +15,23 @@ import nextcord
 from nextcord.errors import NotFound
 from nextcord.ext import commands
 
-import config  # noqa: F401  (первым: загружает .env)
+import config  # первым из своих модулей: загружает .env
 import content_filter as cf
 import delivery
 import diagnostics
 import search
-import tag_help
 import sources
+import tag_help
 import texts
 import tg_source
-from selection import ShownMemory, channel_scope, order_candidates
 from search_ui import NextView
+from selection import ShownMemory, channel_scope, order_candidates
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
                     datefmt="%Y-%m-%d %H:%M:%S")
 logger = logging.getLogger("gelbooru_bot")
 
-VERSION = "3.4.1"
+VERSION = "3.4.2"
 KANZAKI_HIDERI_IMAGE = os.path.join(config.BASE_DIR, "assets", "kanzaki_hideri.jpg")
 
 memory = ShownMemory(os.path.join(config.data_dir(), "shown.sqlite3"),
@@ -49,7 +41,10 @@ KONACHAN = sources.Konachan()
 SAFEBOORU = sources.Safebooru()
 tg_client = None  # Telethon-клиент; поднимается в on_ready, None если ключи не заданы
 
-bot = commands.Bot(intents=nextcord.Intents.default(), default_guild_ids=config.GUILD_IDS or None)
+# allowed_mentions=none: теги и названия каналов из запроса попадают в ответы —
+# «`@everyone`» внутри тега не должен пинговать сервер.
+bot = commands.Bot(intents=nextcord.Intents.default(), default_guild_ids=config.GUILD_IDS or None,
+                   allowed_mentions=nextcord.AllowedMentions.none())
 
 
 # ── Кулдауны (слэш-команды nextcord не поддерживают commands.cooldown) ─────────
@@ -205,7 +200,7 @@ async def run_booru_search(interaction, raw_tags: tuple, source, cooldown: Coold
             return pending
         if not res.candidates:
             message = empty_result_text(res, display_tag, source.name)
-            # Suggestions do not silently modify or broaden the original query.
+            # Подсказка только показывается — сам запрос не меняется и не расширяется.
             if not res.fetched and res.complete and len(tags) == 1 and not tags[0].startswith("-"):
                 hints = await tag_help.suggestions(source, tags[0], nsfw=channel_allows_nsfw(interaction),
                                                   limit=5)
@@ -216,6 +211,7 @@ async def run_booru_search(interaction, raw_tags: tuple, source, cooldown: Coold
             return True
         max_size = delivery.max_upload_size(interaction)
         view = next_view(interaction, tuple(tags), source, cooldown, nsfw)
+
         async def make_payload(post):
             payload, reason = await delivery.build_booru_payload(source, post, display_tag, max_size)
             if payload is not None:
@@ -251,6 +247,7 @@ def register_booru_command(name: str, description: str, source, *, nsfw: bool = 
 
     command.__name__ = name
     registered = bot.slash_command(name=name, description=description)(command)
+
     async def autocomplete(interaction, value):
         choices = await tag_help.suggestions(source, value, nsfw=channel_allows_nsfw(interaction))
         await interaction.response.send_autocomplete(choices)
@@ -361,6 +358,7 @@ async def tag_check_autocomplete(interaction, value):
     await interaction.response.send_autocomplete(choices)
 
 
+# ── /status ───────────────────────────────────────────────────────────────────
 @bot.slash_command(name="status", description="🩺 Состояние бота, API и последнего поиска")
 async def status_command(interaction: nextcord.Interaction):
     if await reject_if_on_cooldown(interaction, COOLDOWNS["status"]):
@@ -390,6 +388,7 @@ async def status_command(interaction: nextcord.Interaction):
     embed.add_field(name="Последний booru-поиск в этом канале", value=value, inline=False)
     embed.set_footer(text="API-проверки кэшируются на 60 с. Успешный API не гарантирует доставку файла.")
     await delivery.safe_followup(interaction, embed=embed, ephemeral=True)
+
 
 # ── /tg — арты из Telegram-каналов ────────────────────────────────────────────
 async def run_tg_search(interaction, alias: str | None):

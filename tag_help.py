@@ -1,4 +1,4 @@
-"""Bounded tag suggestions: safe local fallback, fuzzy spelling, short API budget."""
+"""Подсказки тегов: локальный список, исправление опечаток, короткий бюджет на API."""
 import asyncio
 import difflib
 import re
@@ -19,7 +19,7 @@ COMMON_TAGS = (
     "comic", "scenery", "landscape", "sky", "cloud", "sunset", "mountain", "flower",
     "megumin", "hatsune_miku",
 )
-# No API suggestions in un-gated channels: tag names themselves can be NSFW.
+# Вне NSFW-каналов API не спрашиваем: сами названия тегов бывают NSFW.
 SAFE_TAGS = (
     "solo", "cat_ears", "maid", "twintails", "blonde_hair", "blue_hair", "brown_hair",
     "pink_hair", "purple_hair", "red_hair", "white_hair", "long_hair", "short_hair",
@@ -47,6 +47,7 @@ def permitted(name: str) -> bool:
 
 def ranked(names, part: str, limit: int):
     unique = {n for n in names if isinstance(n, str) and permitted(n)}
+
     def key(name):
         return (not name.startswith(part), part not in name,
                 -difflib.SequenceMatcher(None, part, name).ratio(), name)
@@ -66,7 +67,7 @@ async def suggestions(source, value: str, *, nsfw: bool, limit: int = 25) -> lis
         _cache.move_to_end(key)
         return [prefix + n for n in hit[1][:limit]]
     names = list(local)
-    # Avoid querying on every single-character keystroke or at an un-gated site.
+    # API — только с двух букв и только там, где у сайта есть ключи/доступ.
     remote = getattr(source, "similar_tags", None)
     if nsfw and len(part) >= 2 and callable(remote):
         if not isinstance(source, sources.Gelbooru) or (source.api_key and source.user_id):
@@ -76,7 +77,7 @@ async def suggestions(source, value: str, *, nsfw: bool, limit: int = 25) -> lis
                 names.extend(t.get("name") for t in rows if isinstance(t, dict)
                              and sources.to_int(t.get("count")) and str(t.get("type")) != "6")
             except (sources.SourceError, TimeoutError):
-                pass  # suggestions must never make the actual command unavailable
+                pass  # сбой подсказок не должен ломать саму команду
     result = ranked(names, part, 25)
     _cache[key] = (time.monotonic(), result)
     while len(_cache) > CACHE_MAX:

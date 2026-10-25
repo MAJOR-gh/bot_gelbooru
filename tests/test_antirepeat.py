@@ -1,25 +1,27 @@
-"""Regression suite: full pagination, durable channel history, strict delivery.
+"""Регрессии: полный обход выдачи, долговечная история канала, строгая доставка.
 
-No secrets, Discord connections, Gelbooru API calls or media downloads.
-Run: python -m unittest -v test_antirepeat
+Без секретов, Discord, запросов к API и скачивания файлов.
+Запуск: python -m unittest discover -s tests
 """
-import os as _os, sys as _sys
-_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 import asyncio
 import json
 import os
 import sqlite3
+import sys
 import tempfile
 import unittest
 from io import BytesIO
 from unittest.mock import patch
 
-import nextcord
-import search
-import sources
-import bot_gelbooru as bot
-import selection as sel
-import content_filter as cf
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import nextcord  # noqa: E402
+
+import bot_gelbooru as bot  # noqa: E402
+import content_filter as cf  # noqa: E402
+import search  # noqa: E402
+import selection as sel  # noqa: E402
+import sources  # noqa: E402
 
 
 def post(i, score=None):
@@ -263,9 +265,9 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
         slow = True
         async def fetch(source, tags, page, cursor=None):
             if page > 0 and slow:
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(1)
             return posts[page * 100:(page + 1) * 100], 3200
-        with patch('search.fetch_page', fetch), patch('search.SCAN_TIMEOUT', 0.01):
+        with patch('search.fetch_page', fetch), patch('search.SCAN_TIMEOUT', 0.2):
             result = await search.search(self.source, ['1girl'], set(), exhaustive=True)
             self.assertEqual(result.errors, ['scan_pending'])
             self.assertEqual(result.fetched, 100)

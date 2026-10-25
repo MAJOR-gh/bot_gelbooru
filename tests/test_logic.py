@@ -1,22 +1,24 @@
 """Юнит-тесты логики бота (без подключения к Discord и без сети).
 
-Запуск: python test_bot.py
+Запуск: python -m unittest discover -s tests
 """
-import os as _os, sys as _sys
-_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 import asyncio
+import itertools
 import os
+import sys
 import tempfile
 import time
 from collections import deque
 
-import search
-import sources
-import bot_gelbooru as b
-import content_filter as cf
-import selection as sel
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-# Never touch the production history during tests.
+import bot_gelbooru as b  # noqa: E402
+import content_filter as cf  # noqa: E402
+import search  # noqa: E402
+import selection as sel  # noqa: E402
+import sources  # noqa: E402
+
+# Рабочую историю бота тесты не трогают.
 b.memory = sel.ShownMemory(":memory:")
 _test_cache = tempfile.TemporaryDirectory()
 os.environ['DATA_DIR'] = _test_cache.name
@@ -226,11 +228,14 @@ class FakeSource(sources.Source):
         return "x"
 
 
+_source_ids = itertools.count()   # у каждого фейка своё имя → свой индекс на диске
+
+
 def fake_pages(pages: dict, count=None):
     """pages: {(tuple(tags), page): [posts]} → подмена sources.fetch_page + журнал вызовов."""
     calls = []
     search.clear_search_cache()
-    FakeSource.name = 'Fake-' + str(time.monotonic_ns())
+    FakeSource.name = f"Fake-{next(_source_ids)}"
 
     async def fetch(source, tags, page, cursor=None):
         calls.append((tuple(tags), page))
@@ -299,7 +304,7 @@ async def search_tests():
         async def broken(source, tags, page, cursor=None):
             raise sources.SourceError("auth", "401")
         search.clear_search_cache()
-        FakeSource.name = 'Broken-' + str(time.monotonic_ns())
+        FakeSource.name = f"Broken-{next(_source_ids)}"
         search.fetch_page = broken
         r = await search.search(FakeSource(), ["t"], deque())
         check("source error reported, no candidates", r.errors == ["auth"] and not r.candidates and r.fetched == 0)

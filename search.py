@@ -118,6 +118,8 @@ _scans: "OrderedDict[tuple, ScanState]" = OrderedDict()
 
 def clear_search_cache() -> None:
     clear_page_cache()
+    for state in _scans.values():
+        state.index.close()
     _scans.clear()
 
 
@@ -269,7 +271,7 @@ async def search(source: Source, tags: list[str], recent, *,
     priority_unproven = bool(groups and not proven and not exhaustive)
     priority_pending = priority_unproven and not state.complete
     if priority_unproven:
-        # The page/time budget is never evidence that the priority is optimal.
+        # Кончился бюджет страниц/времени — это не доказательство, что приоритет лучший.
         candidates = []
         if not errors:
             errors = ["scan_pending" if priority_pending else "incomplete"]

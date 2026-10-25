@@ -41,9 +41,9 @@ GELBOORU_USER_ID = env_any("GELBOORU_USER_ID")
 PROXY = env_any("GELBOORU_PROXY", "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy")
 
 _timeout = float(os.environ.get("SEARCH_TIMEOUT_SECONDS", "20"))
-if not 0 < _timeout <= 600:
-    raise ValueError("SEARCH_TIMEOUT_SECONDS должен быть положительным числом до 600")
-SEARCH_TIMEOUT = min(_timeout, 30.0)  # старые env=120 не должны вернуть долгие ожидания
+if _timeout <= 0:
+    raise ValueError("SEARCH_TIMEOUT_SECONDS должен быть положительным числом")
+SEARCH_TIMEOUT = min(_timeout, 30.0)  # больше 30 с пользователь ждать не будет
 
 # ── Telegram ──────────────────────────────────────────────────────────────────
 TG_API_ID = env_any("TG_API_ID", "API_ID", "TELEGRAM_API_ID", "TG_ID")

@@ -22,7 +22,8 @@ import content_filter as cf
 logger = logging.getLogger("gelbooru_bot.sources")
 
 API_TIMEOUT = aiohttp.ClientTimeout(total=15, connect=6)
-MEDIA_TIMEOUT = aiohttp.ClientTimeout(total=60, connect=6, sock_read=20)
+# sock_read — сколько ждать следующий кусок файла: живой CDN не молчит по 10 секунд.
+MEDIA_TIMEOUT = aiohttp.ClientTimeout(total=60, connect=6, sock_read=10)
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
            "Accept": "application/json, text/xml, */*"}
 API_CONCURRENCY = 3          # одновременных запросов к одному сайту
@@ -357,7 +358,11 @@ class Media:
 
 
 async def download(url: str, max_size: int, referer: str = "") -> tuple[bytes | None, str | None]:
-    """Скачать файл не больше max_size. → (данные, None) или (None, 'too_big'|'error')."""
+    """Скачать файл не больше max_size. → (данные, None) или (None, 'too_big'|'error').
+
+    Обрыв соединения повторяем один раз; таймаут — нет: зависший CDN второй раз
+    так же промолчит, а пользователь ждёт. Лучше сразу взять следующий пост.
+    """
     headers = {"Referer": referer} if referer else None
     for attempt in (1, 2):
         try:
@@ -380,6 +385,8 @@ async def download(url: str, max_size: int, referer: str = "") -> tuple[bytes | 
                 return bytes(buf), None
         except (aiohttp.ClientError, asyncio.TimeoutError) as error:
             logger.warning("[download] %s (попытка %s/2): %s", type(error).__name__, attempt, url)
+            if isinstance(error, asyncio.TimeoutError):
+                break
             if attempt == 1:
                 await asyncio.sleep(1.5)
     return None, "error"

@@ -1,4 +1,4 @@
-"""Short-lived Next buttons; authorization, channel checks and duplicate-click guard."""
+"""Кнопка Next: живёт 10 минут, только для автора в исходном канале, без двойных кликов."""
 import asyncio
 import logging
 import time
@@ -35,7 +35,7 @@ class NextView(nextcord.ui.View):
             try:
                 await self.message.edit(view=self)
             except nextcord.HTTPException:
-                logger.debug("Could not disable an expired/deleted Next message")
+                logger.debug("Не удалось выключить Next: сообщение удалено или истекло")
 
     async def on_timeout(self):
         self.consumed = True
@@ -43,7 +43,7 @@ class NextView(nextcord.ui.View):
 
     @nextcord.ui.button(label="Next", emoji="➡️", style=nextcord.ButtonStyle.primary)
     async def next_button(self, button, interaction):
-        # Also verify here so direct callback calls cannot bypass the checks.
+        # Повторная проверка: прямой вызов колбэка не должен обходить interaction_check.
         if not await self.interaction_check(interaction):
             return
         if time.monotonic() >= self.expires_at:
@@ -60,7 +60,7 @@ class NextView(nextcord.ui.View):
             try:
                 advanced = await self.advance(interaction)
             except Exception:
-                logger.exception("Next failed")
+                logger.exception("Next: ошибка продолжения поиска")
                 if interaction.response.is_done():
                     await interaction.followup.send("Не удалось продолжить поиск. Попробуй позже.",
                                                     ephemeral=True)

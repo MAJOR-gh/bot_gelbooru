@@ -1,8 +1,7 @@
-"""Telegram-источник для бота: чтение артов из каналов через userbot (Telethon).
+"""Telegram-источник: арты из каналов через userbot (Telethon).
 
-Тяжёлая логика вынесена сюда, чтобы не раздувать основной файл бота.
-Зависит от уже созданной сессии `tg_userbot.session` (см. tg_login.py) и ключей
-TG_API_ID / TG_API_HASH из переменных окружения.
+Нужны TG_API_ID / TG_API_HASH и сессия: на хостинге — строка TG_SESSION_STRING,
+локально — файл tg_userbot.session (оба даёт tools/tg_export_session.py).
 """
 import json
 import logging
@@ -17,15 +16,8 @@ import config
 logger = logging.getLogger("gelbooru_bot.tg")
 
 SESSION_NAME = "tg_userbot"
-
-
-# Сессия строкой (для хостинга/Docker — файл *.session не доезжает через git);
-# если не задана — файловая сессия (локалка).
-SESSION_STRING = config.TG_SESSION_STRING
-CHANNELS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tg_channels.json")
-
-# Сколько последних сообщений канала просматриваем за один запрос.
-HISTORY_LIMIT = 200
+CHANNELS_FILE = os.path.join(config.BASE_DIR, "tg_channels.json")
+HISTORY_LIMIT = 200           # сколько последних сообщений канала смотрим за запрос
 
 # ── Эвристики отсева рекламы ───────────────────────────────────────────────────
 # Подпись с любым из этих фрагментов считаем рекламой (регистр игнорируется).
@@ -40,14 +32,10 @@ AD_KEYWORDS = (
 
 # ── Клиент ─────────────────────────────────────────────────────────────────────
 async def start_client(api_id: int, api_hash: str) -> TelegramClient:
-    """Поднять Telethon-клиент на уже авторизованной сессии (в текущем loop).
-
-    На хостинге сессия берётся из env TG_SESSION_STRING (StringSession), локально —
-    из файла tg_userbot.session. Так секрет-сессия не лежит в git/Docker-образе.
-    """
-    if SESSION_STRING:
+    """Поднять Telethon-клиент на уже авторизованной сессии (в текущем loop)."""
+    if config.TG_SESSION_STRING:
         logger.info("[tg] использую сессию из TG_SESSION_STRING (env)")
-        client = TelegramClient(StringSession(SESSION_STRING), api_id, api_hash)
+        client = TelegramClient(StringSession(config.TG_SESSION_STRING), api_id, api_hash)
     else:
         logger.info("[tg] использую файловую сессию tg_userbot.session")
         client = TelegramClient(SESSION_NAME, api_id, api_hash)
@@ -55,15 +43,15 @@ async def start_client(api_id: int, api_hash: str) -> TelegramClient:
     if not await client.is_user_authorized():
         await client.disconnect()
         raise RuntimeError(
-            "Сессия Telegram не авторизована. Локально — запусти `python tg_login.py`; "
-            "на хостинге — задай env TG_SESSION_STRING (см. `python tg_export_session.py`)."
+            "Сессия Telegram не авторизована: запусти `python tools/tg_export_session.py` "
+            "и задай TG_SESSION_STRING (или положи tg_userbot.session рядом с ботом)."
         )
     # Прогреваем кэш диалогов: без этого приватные каналы (по числовому ID, без
     # @username) не резолвятся в iter_messages.
     try:
         await client.get_dialogs()
     except Exception as e:
-        logger.warning(f"[tg] get_dialogs не удался (приватные каналы могут не открыться): {e}")
+        logger.warning("[tg] get_dialogs не удался (приватные каналы могут не открыться): %s", e)
     return client
 
 
@@ -87,7 +75,7 @@ def load_channels() -> list[dict]:
         with open(CHANNELS_FILE, encoding="utf-8") as f:
             data = json.load(f)
     except Exception as e:
-        logger.error(f"[tg] не удалось прочитать {CHANNELS_FILE}: {e}")
+        logger.error("[tg] не удалось прочитать %s: %s", CHANNELS_FILE, e)
         return []
     out = []
     for item in data if isinstance(data, list) else []:
@@ -147,7 +135,7 @@ async def fetch_channel_arts(client: TelegramClient, alias: str, peer: str,
     """Просмотреть историю канала → список арт-постов (реклама отсеяна).
 
     Альбом = один пост. Каждый пост: {id, score(=реакции), _site, _alias,
-    _username, _peer_id, _peer, _uid, _msg, _msgs, caption}.
+    _username, _peer_id, _peer, _uid, _legacy_uid, _msg, _msgs, _edge}.
     """
     hit = _scan_cache.get(alias)
     if hit and time.monotonic() - hit[0] < SCAN_TTL:
@@ -162,16 +150,16 @@ async def fetch_channel_arts(client: TelegramClient, alias: str, peer: str,
             gid = getattr(msg, "grouped_id", None)
             groups.setdefault(f"g{gid}" if gid else str(msg.id), []).append(msg)
     except Exception as e:
-        logger.error(f"[tg] ошибка чтения канала {alias}: {type(e).__name__}: {e}")
+        logger.error("[tg] ошибка чтения канала %s: %s: %s", alias, type(e).__name__, e)
         return []
 
+    oldest = min((m.id for msgs in groups.values() for m in msgs), default=None)
     posts: list[dict] = []
     for key, msgs in groups.items():
         if post_is_ad(msgs):
             continue
         msgs.sort(key=lambda m: m.id)
         head = msgs[0]
-        caption = next((m.message for m in msgs if getattr(m, "message", None)), "")
         canonical_peer = getattr(getattr(head, "peer_id", None), "channel_id", None) or peer_val
         posts.append({
             "id": head.id,
@@ -187,7 +175,8 @@ async def fetch_channel_arts(client: TelegramClient, alias: str, peer: str,
             "_legacy_uid": f"TG:{alias}:{key}",
             "_msg": head,
             "_msgs": msgs,
-            "caption": caption[:200],
+            # Альбом на самом краю просмотренной истории мог попасть в скан не целиком.
+            "_edge": bool(getattr(head, "grouped_id", None)) and head.id == oldest,
         })
     _scan_cache[alias] = (time.monotonic(), posts)
     return posts
@@ -205,7 +194,7 @@ async def download_media(client: TelegramClient, msg, max_size: int):
     try:
         data = await client.download_media(msg, file=bytes)
     except Exception as e:
-        logger.error(f"[tg] download error: {e}")
+        logger.error("[tg] не скачалось медиа: %s", e)
         return None, size, "error"
     if not data:
         return None, size, "error"
@@ -217,8 +206,8 @@ async def download_media(client: TelegramClient, msg, max_size: int):
 async def fetch_album_messages(client: TelegramClient, peer, msg) -> list:
     """Вернуть все сообщения альбома (grouped_id), или [msg] если пост одиночный.
 
-    Скан канала мог обрезать альбом на границе истории — поэтому дочитываем
-    соседние сообщения. При ошибке сети — None (возьмём то, что уже есть).
+    Нужно для альбома на границе скана (post["_edge"]): дочитываем соседние
+    сообщения. При ошибке сети — None (возьмём то, что уже есть).
     """
     grouped_id = getattr(msg, "grouped_id", None)
     if not grouped_id:
@@ -229,7 +218,7 @@ async def fetch_album_messages(client: TelegramClient, peer, msg) -> list:
             if getattr(m, "grouped_id", None) == grouped_id:
                 msgs.append(m)
     except Exception as e:
-        logger.warning(f"[tg] альбом не дочитан: {type(e).__name__}: {e}")
+        logger.warning("[tg] альбом не дочитан: %s: %s", type(e).__name__, e)
         return None
     msgs.sort(key=lambda m: m.id)  # хронологический порядок, как в исходном посте
     return msgs or [msg]

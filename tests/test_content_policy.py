@@ -1,4 +1,4 @@
-"""Precise exclusions: allow 1boy without disabling targeted content filters."""
+"""Точечные исключения: 1boy разрешён, а целевые фильтры контента продолжают работать."""
 import hashlib
 import os
 import sys
@@ -100,8 +100,8 @@ class ContentPolicyTests(unittest.TestCase):
             {"tags": "1girl 1boy", "rating": "explicit"}, cf.SAFE_RATINGS))
 
     def test_search_cache_key_tracks_content_policy_change(self):
-        # Changing this policy creates a new index key. Metadata previously fetched
-        # with -1boy is not reused as if it covered the now-expanded result set.
+        # Смена политики меняет ключ индекса: метаданные, собранные со старыми
+        # серверными исключениями, не выдаются за полную выдачу по новым правилам.
         with open(cf.__file__, "rb") as stream:
             self.assertEqual(search.POLICY_HASH, hashlib.sha256(stream.read()).hexdigest())
 

@@ -25,6 +25,7 @@ UPLOAD_MARGIN = 512 * 1024    # запас на embed и обёртку multipar
 MAX_DOWNLOAD_TRIES = 8        # попыток скачивания за вызов, НЕ глубина поиска
 SEND_TIMEOUT = 180.0
 DISCORD_MAX_FILES = 10        # Discord принимает максимум 10 вложений в сообщении
+TG_DOWNLOAD_CONCURRENCY = 4   # файлы альбома Telegram качаются параллельно
 
 
 def max_upload_size(interaction) -> int:
@@ -184,29 +185,39 @@ async def build_tg_payload(client, post: dict, max_size: int):
     """
     msg = post["_msg"]
     album = None
-    if post.get("_peer") is not None:
+    if post.get("_edge") and post.get("_peer") is not None:
         album = await tg_source.fetch_album_messages(client, post["_peer"], msg)
     media_msgs = [m for m in (album or post.get("_msgs") or [msg]) if tg_source.has_visual_media(m)]
     if not media_msgs:
         return None, "no_file"
 
-    has_video = any(tg_source.is_video(m) for m in media_msgs)
-    files, total, skipped = [], 0, 0
-    fingerprints: set[str] = set()
+    # Telegram знает размеры заранее: сразу решаем, что влезет, и качаем это
+    # параллельно, а не по одному файлу (альбом из 10 картинок — в разы быстрее).
+    planned, budget = [], max_size
     for m in media_msgs:
-        remaining = max_size - total
         approx = getattr(getattr(m, "file", None), "size", None)
-        if len(files) >= DISCORD_MAX_FILES or (approx and approx > remaining):
-            skipped += 1
+        if len(planned) >= DISCORD_MAX_FILES or (approx and approx > budget):
             continue
-        data, size, _ = await tg_source.download_media(client, m, remaining)
-        if not data:
-            skipped += 1
+        planned.append(m)
+        budget -= approx or 0
+    limit = asyncio.Semaphore(TG_DOWNLOAD_CONCURRENCY)
+
+    async def fetch(m):
+        async with limit:
+            return await tg_source.download_media(client, m, max_size)
+
+    results = await asyncio.gather(*(fetch(m) for m in planned))
+    has_video = any(tg_source.is_video(m) for m in media_msgs)
+    files, total = [], 0
+    fingerprints: set[str] = set()
+    for m, (data, size, _) in zip(planned, results):
+        if not data or total + size > max_size:      # размер был неизвестен заранее
             continue
         filename = f"tg_{post['_alias']}_{m.id}.{tg_source.media_ext(m)}"
         files.append(nextcord.File(BytesIO(data), filename=filename))
         total += size
         fingerprints.update(content_uids(data))
+    skipped = len(media_msgs) - len(files)
 
     link = tg_source.post_link(post)
     parts = [f"{'🎬' if has_video else '🖼'} **{post['_alias']}** • ❤️ {post.get('score', 0)}"]
