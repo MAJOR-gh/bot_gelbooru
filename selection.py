@@ -148,13 +148,17 @@ class ShownMemory:
         self._db = db
         return db
 
-    def history_status(self, scope: str) -> dict:
-        """Stable database marker and counters; no paths, credentials or post content."""
+    def database_id(self) -> str:
         db = self._connection()
         with db:
             db.execute("INSERT OR IGNORE INTO metadata(key,value) VALUES ('database_id',?)",
                        (uuid.uuid4().hex,))
-        database_id = db.execute("SELECT value FROM metadata WHERE key='database_id'").fetchone()[0]
+        return db.execute("SELECT value FROM metadata WHERE key='database_id'").fetchone()[0]
+
+    def history_status(self, scope: str) -> dict:
+        """Stable database marker and counters; no paths, credentials or post content."""
+        database_id = self.database_id()
+        db = self._connection()
         counts = dict(db.execute("SELECT status, COUNT(*) FROM shown WHERE scope=? GROUP BY status",
                                  (scope,)))
         visuals = db.execute("SELECT COUNT(*) FROM visual_history WHERE scope=?", (scope,)).fetchone()[0]
@@ -253,10 +257,15 @@ class ShownMemory:
                            [(scope, uid, time.time() + ttl) for uid in set(uids)])
 
     def remember(self, scope: str, uid: str) -> None:
+        self.remember_many(scope, [uid])
+
+    def remember_many(self, scope: str, uids: Iterable[str]) -> int:
+        now = time.time()
         db = self._connection()
         with db:
-            db.execute("INSERT OR IGNORE INTO shown VALUES (?,?,'sent',NULL,?)",
-                       (scope, uid, time.time()))
+            result = db.executemany("INSERT OR IGNORE INTO shown VALUES (?,?,'sent',NULL,?)",
+                                    ((scope, uid, now) for uid in uids))
+        return result.rowcount
 
     def close(self) -> None:
         if self._db is not None:

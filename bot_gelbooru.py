@@ -31,11 +31,12 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(na
                     datefmt="%Y-%m-%d %H:%M:%S")
 logger = logging.getLogger("gelbooru_bot")
 
-VERSION = "3.5.4"
+VERSION = "3.5.5"
 KANZAKI_HIDERI_IMAGE = os.path.join(config.BASE_DIR, "assets", "kanzaki_hideri.jpg")
 
 memory = ShownMemory(os.path.join(config.data_dir(), "shown.sqlite3"),
                      legacy_path=os.path.join(config.data_dir(), "recent_shown.json"))
+_recovered_booru_channels: set[str] = set()
 GELBOORU = sources.Gelbooru(config.GELBOORU_API_KEY, config.GELBOORU_USER_ID)
 KONACHAN = sources.Konachan()
 SAFEBOORU = sources.Safebooru()
@@ -203,6 +204,12 @@ async def run_booru_search(interaction, raw_tags: tuple, source, cooldown: Coold
     display_tag = " + ".join(tags)
     scope = channel_scope(interaction)
     try:
+        if scope not in _recovered_booru_channels and bot.user is not None:
+            channel = interaction.channel
+            if callable(getattr(channel, "history", None)):
+                if await delivery.recover_booru_history(
+                        memory, channel, scope, bot.user.id, interaction.application_id):
+                    _recovered_booru_channels.add(scope)
         started = time.monotonic()
         res = await search.search(source, tags, memory.search_history(scope), require_nudity=nsfw)
         diagnostics.record_search(scope, source, res, (time.monotonic() - started) * 1000)
@@ -583,7 +590,11 @@ def main() -> None:
     if not config.DISCORD_TOKEN:
         raise SystemExit("❌ Не задан токен бота: переменная DISCORD_BOT_TOKEN "
                          "(в окружении или в файле .env рядом с ботом).")
+    existing_history = os.path.isfile(memory.path)
     memory.load()
+    logger.info("[anti-repeat] бот v%s, база %s (%s): %s", VERSION,
+                memory.database_id()[:12], "existing" if existing_history else "new",
+                os.path.abspath(memory.path))
     bot.loop.create_task(start_health_server())
     try:
         bot.run(config.DISCORD_TOKEN)

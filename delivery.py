@@ -7,6 +7,7 @@ send_first_fitting — единственная точка отправки ар
 import asyncio
 import hashlib
 import logging
+import re
 from io import BytesIO
 
 import nextcord
@@ -27,6 +28,12 @@ MAX_DOWNLOAD_TRIES = 8        # попыток скачивания за выз�
 SEND_TIMEOUT = 180.0
 DISCORD_MAX_FILES = 10        # Discord принимает максимум 10 вложений в сообщении
 TG_DOWNLOAD_CONCURRENCY = 4   # файлы альбома Telegram качаются параллельно
+DISCORD_HISTORY_LIMIT = 300
+DISCORD_HISTORY_TIMEOUT = 8.0
+_BOORU_NAMES = {source.name.lower(): source.name
+                for source in (sources.Gelbooru, sources.Safebooru, sources.Konachan)}
+_BOORU_ATTACHMENT = re.compile(r"([a-z]+)_([0-9]+)\.[a-zA-Z0-9]+")
+_BOORU_FOOTER = re.compile(r"(Gelbooru|Safebooru|Konachan) • ID ([0-9]+)")
 
 
 def max_upload_size(interaction) -> int:
@@ -131,6 +138,35 @@ async def send_first_fitting(memory: ShownMemory, interaction, scope: str, candi
 
 
 # ── Booru ─────────────────────────────────────────────────────────────────────
+async def recover_booru_history(memory: ShownMemory, channel, scope: str,
+                                bot_id: int, application_id: int) -> bool:
+    """Recover IDs from our own public attachments when the local DB is missing entries."""
+    uids = set()
+    try:
+        async with asyncio.timeout(DISCORD_HISTORY_TIMEOUT):
+            async for message in channel.history(limit=DISCORD_HISTORY_LIMIT):
+                if message.author.id != bot_id and message.webhook_id != application_id:
+                    continue
+                for attachment in message.attachments:
+                    match = _BOORU_ATTACHMENT.fullmatch(attachment.filename)
+                    if match:
+                        site, post_id = match.groups()
+                        if site in _BOORU_NAMES:
+                            uids.add(f"{_BOORU_NAMES[site]}:{post_id}")
+                for embed in message.embeds:
+                    match = _BOORU_FOOTER.fullmatch(embed.footer.text or "")
+                    if match:
+                        site, post_id = match.groups()
+                        uids.add(f"{site}:{post_id}")
+    except (nextcord.HTTPException, TimeoutError) as error:
+        logger.warning("[anti-repeat] не удалось прочитать историю Discord %s: %s", scope, error)
+        return False
+    restored = memory.remember_many(scope, uids)
+    logger.info("[anti-repeat] история Discord %s: найдено %d ID, восстановлено %d",
+                scope, len(uids), restored)
+    return True
+
+
 def format_tags_preview(tags_str: str, limit: int = 14, maxlen: int = 950) -> str:
     """Теги поста → `tag` `tag` … +N (с обрезкой по длине поля embed)."""
     tags = (tags_str or "").split()

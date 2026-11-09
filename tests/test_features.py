@@ -215,6 +215,36 @@ class FeatureTests(unittest.IsolatedAsyncioTestCase):
         second.delete_original_message.assert_awaited_once()  # previous panel removed
         second.followup.send.call_args.kwargs["view"].stop()
 
+    async def test_search_recovers_pre_restart_posts_from_discord_with_empty_db(self):
+        interaction = Interaction()
+        interaction.application_id = 80
+        scope = "discord:1:100"
+        self.assertEqual(bot.memory.recent(scope), set())
+
+        async def history(*, limit):
+            self.assertEqual(limit, 300)
+            yield SimpleNamespace(author=SimpleNamespace(id=80), webhook_id=80, attachments=[],
+                                  embeds=[SimpleNamespace(footer=SimpleNamespace(text="Gelbooru • ID 1"))])
+            yield SimpleNamespace(author=SimpleNamespace(id=81), webhook_id=80, embeds=[],
+                                  attachments=[SimpleNamespace(filename="gelbooru_2.mp4")])
+            yield SimpleNamespace(author=SimpleNamespace(id=99), webhook_id=None, embeds=[],
+                                  attachments=[SimpleNamespace(filename="gelbooru_3.png")])
+
+        async def fetch(source, tags, page, cursor=None):
+            return [post(i, "landscape") for i in (1, 2, 3)], 3
+
+        interaction.channel.history = history
+        with (patch.object(bot.bot._connection, "user", SimpleNamespace(id=80)),
+              patch.object(bot, "_recovered_booru_channels", set()),
+              patch("search.fetch_page", fetch),
+              patch("delivery.build_booru_payload", AsyncMock(return_value=({"content": "new"}, ""))) as build):
+            await bot.run_booru_search(interaction, ("landscape",), self.source,
+                                      bot.CooldownManager(5, 30), nsfw=False)
+        build.assert_awaited_once()
+        self.assertEqual(build.await_args.args[1]["id"], 3)
+        self.assertTrue({"Gelbooru:1", "Gelbooru:2"} <= bot.memory.recent(scope))
+        interaction.followup.send.call_args.kwargs["view"].stop()
+
     async def test_priority_after_six_pages_waits_then_next_finds_it(self):
         rows = [post(i, "1girl nude breasts large_breasts ass_focus" if i < 700
                      else "1girl nude breasts large_breasts") for i in range(1000)]
