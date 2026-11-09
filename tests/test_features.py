@@ -38,6 +38,7 @@ class Interaction:
                                         send_autocomplete=AsyncMock(), is_done=lambda: True)
         self.followup = SimpleNamespace(send=AsyncMock(return_value=SimpleNamespace(edit=AsyncMock())))
         self.message = SimpleNamespace(edit=AsyncMock())
+        self.delete_original_message = AsyncMock()
 
 
 class FeatureTests(unittest.IsolatedAsyncioTestCase):
@@ -77,6 +78,29 @@ class FeatureTests(unittest.IsolatedAsyncioTestCase):
             result = await search.search(self.source, ["landscape"], set(), require_nudity=False)
         self.assertEqual(result.candidates[0]["id"], 100)
         self.assertTrue(all("landscape" in p["tags"] for p in result.candidates))
+
+    async def test_old_panel_deleted_only_after_replacement(self):
+        events = []
+        interaction = Interaction()
+        async def advance(current):
+            events.extend(["art", "new-panel"])
+            return True
+        async def delete():
+            events.append("delete-old-panel")
+        interaction.delete_original_message.side_effect = delete
+        view = NextView(1, 100, advance)
+        await view.next_button.callback(interaction)
+        self.assertEqual(events, ["art", "new-panel", "delete-old-panel"])
+        self.assertTrue(view.is_finished())
+
+    async def test_replacement_failure_keeps_old_panel(self):
+        interaction = Interaction()
+        view = NextView(1, 100, AsyncMock(side_effect=RuntimeError("send failed")))
+        with self.assertLogs("gelbooru_bot.ui", level="ERROR"):
+            await view.next_button.callback(interaction)
+        interaction.delete_original_message.assert_not_awaited()
+        self.assertFalse(view.consumed)
+        view.stop()
 
     async def test_next_rejects_other_user(self):
         advance = AsyncMock(return_value=True)
@@ -184,6 +208,11 @@ class FeatureTests(unittest.IsolatedAsyncioTestCase):
             view = kwargs["view"]
             await view.next_button.callback(second)
         self.assertEqual(second.followup.send.call_args_list[0].kwargs["content"], "art-1")
+        self.assertEqual(second.followup.send.await_count, 2)  # public art + private panel
+        second.response.send_message.assert_not_awaited()
+        second.response.defer.assert_awaited_once_with(with_message=False)
+        first.delete_original_message.assert_awaited_once()  # initial acknowledgement removed
+        second.delete_original_message.assert_awaited_once()  # previous panel removed
         second.followup.send.call_args.kwargs["view"].stop()
 
     async def test_priority_after_six_pages_waits_then_next_finds_it(self):

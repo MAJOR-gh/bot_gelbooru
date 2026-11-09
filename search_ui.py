@@ -37,6 +37,20 @@ class NextView(nextcord.ui.View):
             except nextcord.HTTPException:
                 logger.debug("Не удалось выключить Next: сообщение удалено или истекло")
 
+    async def remove(self, interaction):
+        """Use the fresh component token to delete the previous ephemeral panel."""
+        self.consumed = True
+        for child in self.children:
+            child.disabled = True
+        self.stop()
+        try:
+            await interaction.delete_original_message()
+        except nextcord.NotFound:
+            pass
+        except nextcord.HTTPException:
+            logger.warning("Не удалось удалить старую панель Next; отключаю кнопки")
+            await self.disable()
+
     async def on_timeout(self):
         self.consumed = True
         await self.disable()
@@ -69,10 +83,7 @@ class NextView(nextcord.ui.View):
                                                             ephemeral=True)
                 return
             if advanced:
-                self.consumed = True
-                self.message = getattr(interaction, "message", None) or self.message
-                await self.disable()
-                self.stop()
+                await self.remove(interaction)
     @nextcord.ui.button(label="Завершить", style=nextcord.ButtonStyle.secondary)
     async def finish_button(self, button, interaction):
         if not await self.interaction_check(interaction):
@@ -80,8 +91,5 @@ class NextView(nextcord.ui.View):
         if self.lock.locked():
             await interaction.response.send_message("Дождись завершения текущего поиска.", ephemeral=True)
             return
-        self.consumed = True
-        await interaction.response.defer()
-        self.message = getattr(interaction, "message", None) or self.message
-        await self.disable()
-        self.stop()
+        await interaction.response.defer(with_message=False)
+        await self.remove(interaction)

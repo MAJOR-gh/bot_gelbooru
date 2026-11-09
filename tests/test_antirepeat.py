@@ -675,6 +675,7 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
         interaction.guild = None
         interaction.channel = SimpleNamespace(is_nsfw=lambda: True)
         interaction.response = SimpleNamespace(defer=AsyncMock(), send_message=AsyncMock())
+        interaction.delete_original_message = AsyncMock()
         calls = []
         async def fetch(source, tags, page, cursor=None):
             calls.append(page)

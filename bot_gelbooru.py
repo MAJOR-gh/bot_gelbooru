@@ -31,7 +31,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(na
                     datefmt="%Y-%m-%d %H:%M:%S")
 logger = logging.getLogger("gelbooru_bot")
 
-VERSION = "3.5.0"
+VERSION = "3.5.1"
 KANZAKI_HIDERI_IMAGE = os.path.join(config.BASE_DIR, "assets", "kanzaki_hideri.jpg")
 
 memory = ShownMemory(os.path.join(config.data_dir(), "shown.sqlite3"),
@@ -98,9 +98,11 @@ def channel_allows_nsfw(interaction) -> bool:
         return False
 
 
-async def defer_or_log(interaction, label: str, *, private=False) -> bool:
+async def defer_or_log(interaction, label: str, *, private=False, component=False) -> bool:
     try:
-        if private:
+        if component:
+            await interaction.response.defer(with_message=False)
+        elif private:
             await interaction.response.send_message("Ищу результаты…", ephemeral=True)
         else:
             await interaction.response.defer(with_message=True)
@@ -160,15 +162,15 @@ def empty_result_text(res: search.SearchResult, display_tag: str, site: str) -> 
 
 def next_view(interaction, raw_tags, source, cooldown, nsfw):
     async def advance(next_interaction):
-        return await run_booru_search(next_interaction, raw_tags, source, cooldown, nsfw=nsfw)
+        return await run_booru_search(next_interaction, raw_tags, source, cooldown, nsfw=nsfw, from_next=True)
     return NextView(interaction.user.id, interaction.channel_id, advance)
 
 
-async def send_next_panel(interaction, tags, source, cooldown, nsfw):
+async def send_next_panel(interaction, tags, source, cooldown, nsfw, status=""):
     view = next_view(interaction, tuple(tags), source, cooldown, nsfw)
     try:
         view.message = await interaction.followup.send(
-            content=f"Твой поиск: {' + '.join(tags)} · {source.name}\n"
+            content=(status + "\n\n" if status else "") + f"Твой поиск: {' + '.join(tags)} · {source.name}\n"
             "Next отправит следующий результат в общий канал. Панель действует 10 минут.",
             view=view, ephemeral=True, wait=True)
     except Exception:
@@ -177,7 +179,7 @@ async def send_next_panel(interaction, tags, source, cooldown, nsfw):
 
 
 async def run_booru_search(interaction, raw_tags: tuple, source, cooldown: CooldownManager,
-                           *, nsfw: bool = True):
+                           *, nsfw: bool = True, from_next: bool = False):
     """Общая логика /gelbooru, /konachan, /safebooru (nsfw=False — без NSFW и наготы)."""
     if nsfw and not channel_allows_nsfw(interaction):
         await interaction.response.send_message(texts.NSFW_ONLY, ephemeral=True)
@@ -195,7 +197,7 @@ async def run_booru_search(interaction, raw_tags: tuple, source, cooldown: Coold
     if verdict:
         await answer_verdict(interaction, verdict)
         return False
-    if not await defer_or_log(interaction, source.name, private=True):
+    if not await defer_or_log(interaction, source.name, private=True, component=from_next):
         return False
 
     display_tag = " + ".join(tags)
@@ -231,16 +233,22 @@ async def run_booru_search(interaction, raw_tags: tuple, source, cooldown: Coold
         sent, reasons = await delivery.send_first_fitting(
             memory, interaction, scope,
             (p for p in res.candidates if cf.matches_query(p, tags)), make_payload)
-        if sent is None:
-            await delivery.safe_followup(
-                interaction, texts.nothing_sent(display_tag, source.name, reasons), ephemeral=True)
-        await send_next_panel(interaction, tags, source, cooldown, nsfw)
+        status = texts.nothing_sent(display_tag, source.name, reasons) if sent is None else ""
+        await send_next_panel(interaction, tags, source, cooldown, nsfw, status=status)
         return True
     except NotFound:
         logger.warning("[%s] интеракция протухла", source.name)
     except Exception:
         logger.exception("[%s] ошибка поиска по `%s`", source.name, display_tag)
-        await delivery.safe_followup(interaction, texts.INTERNAL_ERROR)
+        await delivery.safe_followup(interaction, texts.INTERNAL_ERROR, ephemeral=True)
+    finally:
+        # Initial slash acknowledgement is transient. Component callbacks use
+        # silent defer; their original message is the old panel, removed by NextView.
+        if not from_next:
+            try:
+                await interaction.delete_original_message()
+            except nextcord.HTTPException:
+                logger.warning("Не удалось убрать начальный ответ поиска")
     return False
 
 
