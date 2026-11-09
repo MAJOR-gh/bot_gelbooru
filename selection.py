@@ -119,6 +119,12 @@ class ShownMemory:
                     scope TEXT NOT NULL, uid TEXT NOT NULL, retry_at REAL NOT NULL,
                     PRIMARY KEY(scope,uid)
                 );
+                CREATE TABLE IF NOT EXISTS visual_history (
+                    id INTEGER PRIMARY KEY, scope TEXT NOT NULL, token TEXT,
+                    signature TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS visual_scope ON visual_history(scope);
+                CREATE INDEX IF NOT EXISTS visual_token ON visual_history(token);
                 CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT);
             ''')
             if self.legacy_path and not db.execute(
@@ -187,10 +193,30 @@ class ShownMemory:
     def extend(self, scope: str, token: str, uids: Iterable[str]) -> bool:
         return self._claim(scope, uids, token)
 
+    def claim_visual(self, scope: str, token: str, signatures: list[dict]) -> bool:
+        """Atomically compare and reserve, including in-flight sends from other users."""
+        from visual_duplicates import similar
+        db = self._connection()
+        db.execute('BEGIN IMMEDIATE')
+        try:
+            for encoded, owner in db.execute(
+                    'SELECT signature, token FROM visual_history WHERE scope=?', (scope,)):
+                if owner != token and any(similar(sig, json.loads(encoded)) for sig in signatures):
+                    db.rollback()
+                    return False
+            db.executemany('INSERT INTO visual_history(scope,token,signature) VALUES (?,?,?)',
+                           [(scope, token, json.dumps(sig)) for sig in signatures])
+            db.commit()
+            return True
+        except BaseException:
+            db.rollback()
+            raise
+
     def mark_sent(self, token: str) -> None:
         db = self._connection()
         with db:
             db.execute("UPDATE shown SET status='sent',token=NULL WHERE token=?", (token,))
+            db.execute("UPDATE visual_history SET token=NULL WHERE token=?", (token,))
 
     def mark_blocked(self, token: str) -> None:
         """Байты файла уже отправлены/зарезервированы под другим ID — пост не показывать."""
@@ -202,6 +228,7 @@ class ShownMemory:
         db = self._connection()
         with db:
             db.execute("DELETE FROM shown WHERE token=? AND status='pending'", (token,))
+            db.execute("DELETE FROM visual_history WHERE token=?", (token,))
 
     def failed(self, scope: str, uids: Iterable[str], ttl: float = 300) -> None:
         """Не застреваем на одних и тех же восьми битых/слишком больших файлах."""

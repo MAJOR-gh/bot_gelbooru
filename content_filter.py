@@ -306,6 +306,7 @@ def clean_user_tags(raw: tuple | list) -> list[str]:
         if not t or not t.strip():
             continue
         tag = "_".join(t.strip().lower().split())
+        tag = ("-" if tag.startswith("-") else "") + canonical_tag(tag.lstrip("-"))
         if tag not in out:
             out.append(tag)
     return out
@@ -361,3 +362,26 @@ def tag_is_kanzaki_hideri(tag: str) -> bool:
         return False
     low = tag.lower()
     return low in KANZAKI_HIDERI_TAGS or ("kanzaki" in low and "hideri" in low)
+
+
+# Канонические имена применяются одинаково к запросам и метаданным.
+QUERY_ALIASES = {"boobs": "breasts", "boob": "breasts", "butt": "ass"}
+
+
+def canonical_tag(tag: str) -> str:
+    return QUERY_ALIASES.get(tag, tag)
+
+
+def matches_query(post: dict, tags: list[str]) -> bool:
+    """Проверка обычных тегов и исключений перед отправкой; метатеги проверяет сайт."""
+    from fnmatch import fnmatchcase
+    actual = {canonical_tag(t) for t in post_tags(post)}
+    for term in tags:
+        negative = term.startswith("-")
+        name = canonical_tag(term.lstrip("-"))
+        if ":" in name or name.startswith("~"):
+            continue
+        found = any(fnmatchcase(t, name) for t in actual)
+        if found == negative:
+            return False
+    return True

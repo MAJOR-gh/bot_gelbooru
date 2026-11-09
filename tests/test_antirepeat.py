@@ -459,7 +459,9 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(second.candidates), 649)
 
     async def test_lazy_disk_index_survives_cache_eviction(self):
-        fetch, _ = self.pages([post(i) for i in range(3200)])
+        fetch, _ = self.pages([dict(post(i), tags="1girl nude first " +
+                                   " ".join(str(n) for n in range(search.OPEN_INDEXES + 1)))
+                               for i in range(3200)])
         with patch('search.fetch_page', fetch):
             held = await search.search(self.source, ['first'], set(), exhaustive=True)
             for i in range(search.OPEN_INDEXES + 1):
@@ -471,7 +473,7 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
     async def test_sql_ranking_matches_selection(self):
         import random
         rng = random.Random(123)
-        posts = [dict(post(i), tags=rng.choice([
+        posts = [dict(post(i), tags='breasts ' + rng.choice([
             '1girl nude large_breasts', '1girl nude', '1girl smile',
             '1girl nude ass_focus', 'fully_clothed']), score=rng.randrange(10))
             for i in range(200)]
@@ -682,11 +684,14 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
             return {'content': 'new-art-' + str(p['id'])}, ''
         with patch('search.fetch_page', fetch), patch('delivery.build_booru_payload', make):
             await bot.run_booru_search(interaction, ('1girl',), self.source, bot.CooldownManager(5, 30))
-        interaction.response.defer.assert_awaited_once()
+        interaction.response.send_message.assert_awaited_once()
+        self.assertTrue(interaction.response.send_message.call_args.kwargs["ephemeral"])
         self.assertEqual(calls, [0])
-        self.assertEqual(len(interaction.followup.sent), 1)
+        self.assertEqual(len(interaction.followup.sent), 2)
         self.assertEqual(interaction.followup.sent[0]['content'], 'new-art-0')
-        self.assertEqual(interaction.followup.sent[0]['view'].next_button.label, 'Next')
+        self.assertNotIn('view', interaction.followup.sent[0])
+        self.assertTrue(interaction.followup.sent[1]['ephemeral'])
+        self.assertEqual(interaction.followup.sent[1]['view'].next_button.label, 'Next')
         self.assertIn('image-0', bot.memory.recent(self.scope))
 
 

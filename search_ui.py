@@ -73,3 +73,15 @@ class NextView(nextcord.ui.View):
                 self.message = getattr(interaction, "message", None) or self.message
                 await self.disable()
                 self.stop()
+    @nextcord.ui.button(label="Завершить", style=nextcord.ButtonStyle.secondary)
+    async def finish_button(self, button, interaction):
+        if not await self.interaction_check(interaction):
+            return
+        if self.lock.locked():
+            await interaction.response.send_message("Дождись завершения текущего поиска.", ephemeral=True)
+            return
+        self.consumed = True
+        await interaction.response.defer()
+        self.message = getattr(interaction, "message", None) or self.message
+        await self.disable()
+        self.stop()

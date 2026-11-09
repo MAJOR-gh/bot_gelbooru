@@ -106,8 +106,8 @@ class DeepSearchTests(unittest.IsolatedAsyncioTestCase):
     async def test_focus_priority_reads_next_page_instead_of_settling(self):
         # Ищем breasts. На 1-й странице только посты с фокусом на ДРУГОЙ части тела,
         # на 2-й — с фокусом на груди. Раньше бот довольствовался 1-й страницей.
-        page1 = [post(i, 1000 - i, "1girl nude large_breasts ass_focus") for i in range(100)]
-        page2 = [post(100 + i, 800 - i, "1girl nude large_breasts") for i in range(100)]
+        page1 = [post(i, 1000 - i, "1girl nude breasts large_breasts ass_focus") for i in range(100)]
+        page2 = [post(100 + i, 800 - i, "1girl nude breasts large_breasts") for i in range(100)]
         site = FakeSite(page1 + page2)
         with patch("search.fetch_page", site.fetch):
             result = await search.search(Capped(), ["breasts"], set())

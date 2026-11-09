@@ -246,12 +246,12 @@ def fake_pages(pages: dict, count=None):
 
 
 def nude(i, score=None):
-    return {"md5": f"n{i}", "tags": "1girl nude", "score": score if score is not None else 100 - i,
+    return {"md5": f"n{i}", "tags": "t 1girl nude", "score": score if score is not None else 100 - i,
             "rating": "explicit"}
 
 
 def dressed_post(i):
-    return {"md5": f"d{i}", "tags": "1girl", "score": 500 - i, "rating": "explicit"}
+    return {"md5": f"d{i}", "tags": "t 1girl", "score": 500 - i, "rating": "explicit"}
 
 
 async def search_tests():
@@ -296,8 +296,8 @@ async def search_tests():
               all(c[0] == ("t",) for c in calls) and r.candidates[0]["md5"] == "d0")
 
         print("== search: filters & errors ==")
-        bad = {(("t",), 0): [{"md5": "l", "tags": "loli nude", "score": 9, "rating": "explicit"},
-                             {"md5": "s", "tags": "nude", "score": 9, "rating": "safe"},
+        bad = {(("t",), 0): [{"md5": "l", "tags": "t loli nude", "score": 9, "rating": "explicit"},
+                             {"md5": "s", "tags": "t nude", "score": 9, "rating": "safe"},
                              nude(1)]}
         search.fetch_page, _ = fake_pages(bad)
         r = await search.search(FakeSource(), ["t"], deque())

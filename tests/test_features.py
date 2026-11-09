@@ -61,6 +61,23 @@ class FeatureTests(unittest.IsolatedAsyncioTestCase):
         self.env.stop()
         self.tmp.cleanup()
 
+    async def test_finish_panel_and_pending_privacy(self):
+        advance = AsyncMock()
+        view = NextView(1, 100, advance)
+        await view.finish_button.callback(Interaction())
+        self.assertTrue(view.consumed)
+        self.assertTrue(view.is_finished())
+        advance.assert_not_awaited()
+
+    async def test_unrelated_page_does_not_prevent_matching_next_page(self):
+        rows = [post(i, "sky" if i < 100 else "landscape") for i in range(200)]
+        async def fetch(source, tags, page, cursor=None):
+            return rows[page*100:(page+1)*100], 200
+        with patch("search.fetch_page", fetch):
+            result = await search.search(self.source, ["landscape"], set(), require_nudity=False)
+        self.assertEqual(result.candidates[0]["id"], 100)
+        self.assertTrue(all("landscape" in p["tags"] for p in result.candidates))
+
     async def test_next_rejects_other_user(self):
         advance = AsyncMock(return_value=True)
         view = NextView(1, 100, advance)
@@ -159,16 +176,19 @@ class FeatureTests(unittest.IsolatedAsyncioTestCase):
         with patch("search.fetch_page", fetch), patch("delivery.build_booru_payload", payload):
             await bot.run_booru_search(first, ("1girl", "-glasses"), self.source,
                                       bot.CooldownManager(5, 30))
+            public = first.followup.send.call_args_list[0].kwargs
+            self.assertEqual(public["content"], "art-0")
+            self.assertNotIn("view", public)
             kwargs = first.followup.send.call_args.kwargs
-            self.assertEqual(kwargs["content"], "art-0")
+            self.assertTrue(kwargs["ephemeral"])
             view = kwargs["view"]
             await view.next_button.callback(second)
-        self.assertEqual(second.followup.send.call_args.kwargs["content"], "art-1")
+        self.assertEqual(second.followup.send.call_args_list[0].kwargs["content"], "art-1")
         second.followup.send.call_args.kwargs["view"].stop()
 
     async def test_priority_after_six_pages_waits_then_next_finds_it(self):
-        rows = [post(i, "1girl nude large_breasts ass_focus" if i < 700
-                     else "1girl nude large_breasts") for i in range(1000)]
+        rows = [post(i, "1girl nude breasts large_breasts ass_focus" if i < 700
+                     else "1girl nude breasts large_breasts") for i in range(1000)]
         async def fetch(source, tags, page, cursor=None):
             return rows[page*100:(page+1)*100], 1000
         with patch("search.fetch_page", fetch):
@@ -183,7 +203,7 @@ class FeatureTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(cf.focus_tier(p, {"breasts"}) == cf.TOP_TIER for p in result.candidates))
 
     async def test_pending_search_has_next_and_no_download(self):
-        rows = [post(i, "1girl nude large_breasts ass_focus") for i in range(1000)]
+        rows = [post(i, "1girl nude breasts large_breasts ass_focus") for i in range(1000)]
         async def fetch(source, tags, page, cursor=None):
             return rows[page*100:(page+1)*100], 1000
         interaction = Interaction()
@@ -192,12 +212,13 @@ class FeatureTests(unittest.IsolatedAsyncioTestCase):
             download.assert_not_awaited()
         kwargs = interaction.followup.send.call_args.kwargs
         self.assertIn("Приоритет", interaction.followup.send.call_args.args[0])
+        self.assertTrue(kwargs["ephemeral"])
         self.assertIsInstance(kwargs["view"], NextView)
         self.assertIsNotNone(kwargs["view"].message)
         kwargs["view"].stop()
 
     async def test_complete_focus_search_can_fall_back_if_no_top_tier_exists(self):
-        rows = [post(i, "1girl nude large_breasts ass_focus") for i in range(100)]
+        rows = [post(i, "1girl nude breasts large_breasts ass_focus") for i in range(100)]
         async def fetch(source, tags, page, cursor=None):
             return rows if page == 0 else [], 100
         with patch("search.fetch_page", fetch):
@@ -207,7 +228,7 @@ class FeatureTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result.candidates)
 
     async def test_incomplete_focus_pagination_does_not_offer_endless_next(self):
-        rows = [post(i, "1girl nude large_breasts ass_focus") for i in range(100)]
+        rows = [post(i, "1girl nude breasts large_breasts ass_focus") for i in range(100)]
         async def fetch(source, tags, page, cursor=None):
             return rows if page == 0 else [], 10000
         with patch("search.fetch_page", fetch):
@@ -304,8 +325,8 @@ class FeatureTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual((await diagnostics.probe(sources.Safebooru())).state, "ok")
 
     async def test_pending_next_reaches_late_focus_end_to_end(self):
-        rows = [post(i, "1girl nude large_breasts ass_focus" if i < 700
-                     else "1girl nude large_breasts") for i in range(1000)]
+        rows = [post(i, "1girl nude breasts large_breasts ass_focus" if i < 700
+                     else "1girl nude breasts large_breasts") for i in range(1000)]
         async def fetch(source, tags, page, cursor=None):
             return rows[page*100:(page+1)*100], 1000
         async def payload(source, p, display, max_size):
@@ -315,7 +336,7 @@ class FeatureTests(unittest.IsolatedAsyncioTestCase):
             await bot.run_booru_search(first, ("breasts",), self.source, bot.CooldownManager(5, 30))
             view = first.followup.send.call_args.kwargs["view"]
             await view.next_button.callback(second)
-        self.assertEqual(second.followup.send.call_args.kwargs["content"], "art-700")
+        self.assertEqual(second.followup.send.call_args_list[0].kwargs["content"], "art-700")
         self.assertNotIn("m0", bot.memory.recent("discord:1:100"))
         self.assertIn("m700", bot.memory.recent("discord:1:100"))
         second.followup.send.call_args.kwargs["view"].stop()

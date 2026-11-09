@@ -36,7 +36,7 @@ NEED_FRESH = 5            # сколько «доказанно лучших» �
 SCAN_TIMEOUT = config.SEARCH_TIMEOUT
 REFRESH_AFTER = 600.0     # законченный обход перечитывается не чаще раза в 10 минут
 OPEN_INDEXES = 4          # одновременно открытых индексов в памяти
-KEY_VERSION = "3.3"
+KEY_VERSION = "3.5"
 
 with open(cf.__file__, "rb") as _policy:
     POLICY_HASH = hashlib.sha256(_policy.read()).hexdigest()
@@ -152,11 +152,11 @@ def _next_pages(source: Source, state: ScanState, budget: int) -> list[int]:
     return list(range(state.next_page, last))
 
 
-def _records(posts, state: ScanState, source: Source, groups, nudity, require_nudity):
+def _records(posts, state: ScanState, source: Source, groups, nudity, require_nudity, tags=()):
     for offset, post in enumerate(posts):
         site_id = f"{post.get('_site')}:{post['id']}" if post.get("id") is not None else ""
         yield (post_uid(post), site_id, json.dumps(post),
-               int(cf.post_is_allowed(post, source.ratings)),
+               int(cf.post_is_allowed(post, source.ratings) and cf.matches_query(post, tags)),
                int(not require_nudity or cf.has_nudity(post, nudity)),
                cf.focus_tier(post, groups), post_score(post), state.seq * 1000 + offset)
 
@@ -199,12 +199,12 @@ async def _scan(source: Source, tags: list[str], state: ScanState, require_nudit
                                    source.name, page, state.cursor, state.fetched, state.total, error)
                     raise error
                 read += 1
-                if _ingest(source, state, page, *result, groups, nudity, require_nudity):
+                if _ingest(source, state, page, *result, groups, nudity, require_nudity, tags):
                     break
 
 
 def _ingest(source, state: ScanState, page: int, posts: list[dict], count: int | None,
-            groups, nudity, require_nudity) -> bool:
+            groups, nudity, require_nudity, tags=()) -> bool:
     """Учесть одну страницу. True — дальше эту пачку страниц не обрабатывать."""
     if page == 0 and not state.cursor:
         state.total = count if count is not None and count >= 0 else None
@@ -231,7 +231,7 @@ def _ingest(source, state: ScanState, page: int, posts: list[dict], count: int |
                        source.name, page)
         return True
     new_allowed, new_total = state.index.add(list(_records(posts, state, source, groups,
-                                                            nudity, require_nudity)))
+                                                            nudity, require_nudity, tags)))
     state.allowed += new_allowed
     state.fetched += new_total if state.in_bucket else len(posts)  # в курсоре бывают уже прочитанные
     state.seq += 1

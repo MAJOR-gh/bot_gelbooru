@@ -16,6 +16,7 @@ import config
 import sources
 import texts
 import tg_source
+import visual_duplicates
 from selection import ShownMemory, post_uid, post_uids
 
 logger = logging.getLogger("gelbooru_bot.delivery")
@@ -98,6 +99,11 @@ async def send_first_fitting(memory: ShownMemory, interaction, scope: str, candi
                         reasons.add("duplicate")
                         logger.info("[anti-repeat] совпали байты файла %s в %s", post_uid(post), scope)
                         continue
+                    visuals = payload.get("_visuals") or []
+                    if visuals and not memory.claim_visual(scope, token, visuals):
+                        memory.mark_blocked(token)
+                        reasons.add("duplicate")
+                        continue
                     delivery_started = True
                     try:
                         message = await interaction.followup.send(**_send_kwargs(payload))
@@ -168,6 +174,10 @@ async def build_booru_payload(source, post: dict, display_tag: str, max_size: in
     filename = f"{source.name.lower()}_{post.get('id') or 'art'}.{media.ext}"
     payload = {"file": nextcord.File(BytesIO(media.data), filename=filename),
                "_uids": content_uids(media.data)}
+    if not media.is_video:
+        signature = await asyncio.to_thread(visual_duplicates.fingerprint, media.data)
+        if signature:
+            payload["_visuals"] = [signature]
     if media.is_video:
         payload["content"] = (f"🎬 **Видео** `{display_tag}` • 📊 {post.get('score', 'N/A')} • "
                               f"🔞 {texts.rating_label(post)} • {size / MB:.1f} MB • "

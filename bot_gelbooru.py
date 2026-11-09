@@ -31,7 +31,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(na
                     datefmt="%Y-%m-%d %H:%M:%S")
 logger = logging.getLogger("gelbooru_bot")
 
-VERSION = "3.4.3"
+VERSION = "3.5.0"
 KANZAKI_HIDERI_IMAGE = os.path.join(config.BASE_DIR, "assets", "kanzaki_hideri.jpg")
 
 memory = ShownMemory(os.path.join(config.data_dir(), "shown.sqlite3"),
@@ -98,9 +98,12 @@ def channel_allows_nsfw(interaction) -> bool:
         return False
 
 
-async def defer_or_log(interaction, label: str) -> bool:
+async def defer_or_log(interaction, label: str, *, private=False) -> bool:
     try:
-        await interaction.response.defer(with_message=True)
+        if private:
+            await interaction.response.send_message("Ищу результаты…", ephemeral=True)
+        else:
+            await interaction.response.defer(with_message=True)
         return True
     except (NotFound, nextcord.HTTPException) as error:
         logger.warning("[%s] defer не удался: %s", label, error)
@@ -161,6 +164,18 @@ def next_view(interaction, raw_tags, source, cooldown, nsfw):
     return NextView(interaction.user.id, interaction.channel_id, advance)
 
 
+async def send_next_panel(interaction, tags, source, cooldown, nsfw):
+    view = next_view(interaction, tuple(tags), source, cooldown, nsfw)
+    try:
+        view.message = await interaction.followup.send(
+            content=f"Твой поиск: {' + '.join(tags)} · {source.name}\n"
+            "Next отправит следующий результат в общий канал. Панель действует 10 минут.",
+            view=view, ephemeral=True, wait=True)
+    except Exception:
+        view.stop()
+        raise
+
+
 async def run_booru_search(interaction, raw_tags: tuple, source, cooldown: CooldownManager,
                            *, nsfw: bool = True):
     """Общая логика /gelbooru, /konachan, /safebooru (nsfw=False — без NSFW и наготы)."""
@@ -180,7 +195,7 @@ async def run_booru_search(interaction, raw_tags: tuple, source, cooldown: Coold
     if verdict:
         await answer_verdict(interaction, verdict)
         return False
-    if not await defer_or_log(interaction, source.name):
+    if not await defer_or_log(interaction, source.name, private=True):
         return False
 
     display_tag = " + ".join(tags)
@@ -194,7 +209,7 @@ async def run_booru_search(interaction, raw_tags: tuple, source, cooldown: Coold
             text = (texts.scan_pending(res.fetched, res.total, priority=res.priority_pending) if pending
                     else texts.source_error(source.name, res.errors))
             kwargs = {"view": next_view(interaction, tuple(tags), source, cooldown, nsfw)} if pending else {}
-            message = await interaction.followup.send(text, **kwargs)
+            message = await interaction.followup.send(text, ephemeral=True, **kwargs)
             if pending:
                 kwargs["view"].message = message
             return pending
@@ -207,21 +222,19 @@ async def run_booru_search(interaction, raw_tags: tuple, source, cooldown: Coold
                 hints = [h for h in hints if h != tags[0]]
                 if hints:
                     message += "\n💡 Возможно, ты имел в виду: " + ", ".join(f"`{h}`" for h in hints)
-            await interaction.followup.send(message)
+            await interaction.followup.send(message, ephemeral=True)
             return True
         max_size = delivery.max_upload_size(interaction)
-        view = next_view(interaction, tuple(tags), source, cooldown, nsfw)
-
         async def make_payload(post):
             payload, reason = await delivery.build_booru_payload(source, post, display_tag, max_size)
-            if payload is not None:
-                payload["view"] = view
             return payload, reason
         sent, reasons = await delivery.send_first_fitting(
-            memory, interaction, scope, res.candidates, make_payload)
+            memory, interaction, scope,
+            (p for p in res.candidates if cf.matches_query(p, tags)), make_payload)
         if sent is None:
-            view.message = await delivery.safe_followup(
-                interaction, texts.nothing_sent(display_tag, source.name, reasons), view=view)
+            await delivery.safe_followup(
+                interaction, texts.nothing_sent(display_tag, source.name, reasons), ephemeral=True)
+        await send_next_panel(interaction, tags, source, cooldown, nsfw)
         return True
     except NotFound:
         logger.warning("[%s] интеракция протухла", source.name)
