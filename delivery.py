@@ -103,6 +103,7 @@ async def send_first_fitting(memory: ShownMemory, interaction, scope: str, candi
                     if visuals and not memory.claim_visual(scope, token, visuals):
                         memory.mark_blocked(token)
                         reasons.add("duplicate")
+                        logger.info("[anti-repeat] совпали изображения %s в %s", post_uid(post), scope)
                         continue
                     delivery_started = True
                     try:

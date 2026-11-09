@@ -29,6 +29,29 @@ def encode(im, fmt="PNG", **kwargs):
 
 
 class VisualTests(unittest.TestCase):
+    def test_normalized_pixels_match_across_formats_without_perceptual_hash(self):
+        flat = Image.new("RGB", (40, 30), "blue")
+        png, bmp = encode(flat), encode(flat, "BMP")
+        self.assertNotEqual(png, bmp)
+        original, converted = fingerprint(png), fingerprint(bmp)
+        self.assertNotIn("phash", original)
+        self.assertTrue(similar(original, converted))
+        self.assertFalse(similar(original, fingerprint(encode(flat.resize((30, 40))))))
+        self.assertFalse(similar(original, fingerprint(encode(Image.new("RGB", flat.size, "red")))))
+
+    def test_phash_catches_recompressed_copies_missed_by_legacy_signature(self):
+        original = fingerprint(encode(sample()))
+        legacy = {key: original[key] for key in ("version", "h", "v", "ratio", "color")}
+        for transform in (lambda im: im, ImageOps.mirror):
+            with self.subTest(transform=transform):
+                resized = transform(sample().resize((160, 120)))
+                compressed = fingerprint(encode(resized, "JPEG", quality=30))
+                self.assertFalse(similar(legacy, compressed))
+                self.assertTrue(similar(original, compressed))
+                self.assertTrue(similar(compressed, original))
+        other = fingerprint(encode(sample(7).resize((160, 120)), "JPEG", quality=30))
+        self.assertFalse(similar(original, other))
+
     def test_resize_compression_and_different_picture(self):
         original = fingerprint(encode(sample()))
         smaller = fingerprint(encode(sample().resize((640, 480)), "JPEG", quality=85))
