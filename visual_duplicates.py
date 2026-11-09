@@ -4,6 +4,7 @@ import warnings
 from PIL import Image, ImageOps, UnidentifiedImageError
 
 MAX_PIXELS = 20_000_000
+CROP_PERCENTAGES = (2, 4, 6)
 
 
 def fingerprint(data: bytes) -> dict | None:
@@ -19,6 +20,16 @@ def fingerprint(data: bytes) -> dict | None:
                     mirrored = _signature(ImageOps.mirror(image))
                     if mirrored is not None:
                         result["mirror"] = mirrored
+                    crops = []
+                    for percentage in CROP_PERCENTAGES:
+                        x = round(image.width * percentage / 100)
+                        y = round(image.height * percentage / 100)
+                        if x or y:
+                            crop = _signature(image.crop((x, y, image.width - x, image.height - y)))
+                            if crop is not None:
+                                crops.append(crop)
+                    if crops:
+                        result["crops"] = crops
                 return result
     except (UnidentifiedImageError, OSError, ValueError, Image.DecompressionBombError,
             Image.DecompressionBombWarning):
@@ -55,4 +66,6 @@ def similar(a: dict, b: dict) -> bool:
     # Optional mirror keeps existing v1 history comparable without reindexing.
     return (_similar_direct(a, b)
             or ("mirror" in a and _similar_direct(a["mirror"], b))
-            or ("mirror" in b and _similar_direct(a, b["mirror"])))
+            or ("mirror" in b and _similar_direct(a, b["mirror"]))
+            or any(_similar_direct(crop, b) for crop in a.get("crops", ()))
+            or any(_similar_direct(a, crop) for crop in b.get("crops", ())))

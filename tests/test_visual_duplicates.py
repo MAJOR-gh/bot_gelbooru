@@ -57,6 +57,18 @@ class VisualTests(unittest.TestCase):
                 one.close()
                 two.close()
 
+    def test_center_crop_matches_full_image_but_not_unrelated_image(self):
+        full = fingerprint(encode(sample()))
+        for percentage in (2, 4, 6):
+            with self.subTest(percentage=percentage):
+                x, y = round(320 * percentage / 100), round(240 * percentage / 100)
+                cropped = fingerprint(encode(sample().crop((x, y, 320-x, 240-y)),
+                                             "JPEG", quality=85))
+                cropped.pop("crops", None)  # Can compare with old stored crop signatures.
+                self.assertTrue(similar(full, cropped))
+                self.assertTrue(similar(cropped, full))
+                self.assertFalse(similar(full, fingerprint(encode(sample(7)))))
+
     def test_mirror_compares_with_existing_history(self):
         original = fingerprint(encode(sample()))
         original.pop("mirror", None)  # history saved by v3.5.0/3.5.1
