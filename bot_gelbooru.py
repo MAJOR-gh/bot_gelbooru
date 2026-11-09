@@ -31,7 +31,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(na
                     datefmt="%Y-%m-%d %H:%M:%S")
 logger = logging.getLogger("gelbooru_bot")
 
-VERSION = "3.5.1"
+VERSION = "3.5.2"
 KANZAKI_HIDERI_IMAGE = os.path.join(config.BASE_DIR, "assets", "kanzaki_hideri.jpg")
 
 memory = ShownMemory(os.path.join(config.data_dir(), "shown.sqlite3"),
@@ -395,6 +395,14 @@ async def status_command(interaction: nextcord.Interaction):
         embed.add_field(name=source.name, value=diagnostics.health_text(result), inline=False)
     embed.add_field(name="Кэш в памяти",
                     value=f"Страниц: {len(sources._page_cache)} · индексов: {len(search._scans)}",
+                    inline=False)
+    history = memory.history_status(channel_scope(interaction))
+    embed.add_field(name="История повторов в этом канале",
+                    value=(f"База: `{history['database_id'][:12]}`\n"
+                           f"ID показанных: {history['sent_ids']} · резервов: {history['pending_ids']} · "
+                           f"дублей: {history['blocked_ids']}\n"
+                           f"Визуальных отпечатков: {history['visuals']}\n"
+                           "ID базы должен сохраняться после перезапуска. Счётчики ID — не число артов."),
                     inline=False)
     last = diagnostics.last_search(channel_scope(interaction))
     if last:

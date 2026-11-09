@@ -6,7 +6,7 @@ import random
 import tempfile
 import unittest
 from io import BytesIO
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageOps
 from selection import ShownMemory
 from visual_duplicates import fingerprint, similar
 import content_filter as cf
@@ -56,6 +56,34 @@ class VisualTests(unittest.TestCase):
             finally:
                 one.close()
                 two.close()
+
+    def test_mirror_compares_with_existing_history(self):
+        original = fingerprint(encode(sample()))
+        original.pop("mirror", None)  # history saved by v3.5.0/3.5.1
+        mirrored = fingerprint(encode(ImageOps.mirror(sample()), "JPEG", quality=85))
+        self.assertTrue(similar(original, mirrored))
+        self.assertTrue(similar(mirrored, original))
+        self.assertFalse(similar(original, fingerprint(encode(ImageOps.mirror(sample(7))))))
+
+    def test_two_hundred_restarts_keep_history_and_database_marker(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, "shown.sqlite3")
+            marker = None
+            for i in range(200):
+                memory = ShownMemory(path)
+                try:
+                    status = memory.history_status("channel")
+                    if marker is None:
+                        marker = status["database_id"]
+                    self.assertEqual(status["database_id"], marker)
+                    for old in range(i):
+                        self.assertIsNone(memory.reserve("channel", {f"id-{old}"}))
+                    token = memory.reserve("channel", {f"id-{i}"})
+                    self.assertIsNotNone(token)
+                    memory.mark_sent(token)
+                    self.assertEqual(memory.history_status("channel")["sent_ids"], i+1)
+                finally:
+                    memory.close()
 
     def test_aliases_required_tags_and_exclusions(self):
         self.assertEqual(cf.clean_user_tags(["Boobs", "-BUTT"]), ["breasts", "-ass"])

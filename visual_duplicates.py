@@ -14,24 +14,33 @@ def fingerprint(data: bytes) -> dict | None:
                 if getattr(original, "is_animated", False) or original.width * original.height > MAX_PIXELS:
                     return None
                 image = ImageOps.exif_transpose(original).convert("RGB")
-                gray = image.convert("L")
-                values = list(gray.resize((17, 16), Image.Resampling.LANCZOS).tobytes())
-                bits = [values[y*17+x] > values[y*17+x+1] for y in range(16) for x in range(16)]
-                if not 24 <= sum(bits) <= 232:
-                    return None  # Flat/simple images have unreliable perceptual hashes.
-                h = sum(int(b) << i for i, b in enumerate(bits))
-                values = list(gray.resize((16, 17), Image.Resampling.LANCZOS).tobytes())
-                v = sum(int(values[y*16+x] > values[(y+1)*16+x]) << (y*16+x)
-                        for y in range(16) for x in range(16))
-                color = image.resize((8, 8), Image.Resampling.LANCZOS).tobytes().hex()
-                return {"version": 1, "h": hex(h), "v": hex(v),
-                        "ratio": image.width / image.height, "color": color}
+                result = _signature(image)
+                if result is not None:
+                    mirrored = _signature(ImageOps.mirror(image))
+                    if mirrored is not None:
+                        result["mirror"] = mirrored
+                return result
     except (UnidentifiedImageError, OSError, ValueError, Image.DecompressionBombError,
             Image.DecompressionBombWarning):
         return None
 
 
-def similar(a: dict, b: dict) -> bool:
+def _signature(image: Image.Image) -> dict | None:
+    gray = image.convert("L")
+    values = list(gray.resize((17, 16), Image.Resampling.LANCZOS).tobytes())
+    bits = [values[y*17+x] > values[y*17+x+1] for y in range(16) for x in range(16)]
+    if not 24 <= sum(bits) <= 232:
+        return None  # Flat/simple images have unreliable perceptual hashes.
+    h = sum(int(b) << i for i, b in enumerate(bits))
+    values = list(gray.resize((16, 17), Image.Resampling.LANCZOS).tobytes())
+    v = sum(int(values[y*16+x] > values[(y+1)*16+x]) << (y*16+x)
+            for y in range(16) for x in range(16))
+    color = image.resize((8, 8), Image.Resampling.LANCZOS).tobytes().hex()
+    return {"version": 1, "h": hex(h), "v": hex(v),
+            "ratio": image.width / image.height, "color": color}
+
+
+def _similar_direct(a: dict, b: dict) -> bool:
     if a["version"] != b["version"] or abs(a["ratio"] / b["ratio"] - 1) > .02:
         return False
     if (int(a["h"], 16) ^ int(b["h"], 16)).bit_count() > 6:
@@ -40,3 +49,10 @@ def similar(a: dict, b: dict) -> bool:
         return False
     aa, bb = bytes.fromhex(a["color"]), bytes.fromhex(b["color"])
     return sum((x-y)**2 for x, y in zip(aa, bb)) / len(aa) <= 100
+
+
+def similar(a: dict, b: dict) -> bool:
+    # Optional mirror keeps existing v1 history comparable without reindexing.
+    return (_similar_direct(a, b)
+            or ("mirror" in a and _similar_direct(a["mirror"], b))
+            or ("mirror" in b and _similar_direct(a, b["mirror"])))

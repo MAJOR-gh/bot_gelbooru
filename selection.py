@@ -148,6 +148,20 @@ class ShownMemory:
         self._db = db
         return db
 
+    def history_status(self, scope: str) -> dict:
+        """Stable database marker and counters; no paths, credentials or post content."""
+        db = self._connection()
+        with db:
+            db.execute("INSERT OR IGNORE INTO metadata(key,value) VALUES ('database_id',?)",
+                       (uuid.uuid4().hex,))
+        database_id = db.execute("SELECT value FROM metadata WHERE key='database_id'").fetchone()[0]
+        counts = dict(db.execute("SELECT status, COUNT(*) FROM shown WHERE scope=? GROUP BY status",
+                                 (scope,)))
+        visuals = db.execute("SELECT COUNT(*) FROM visual_history WHERE scope=?", (scope,)).fetchone()[0]
+        return {"database_id": database_id, "sent_ids": counts.get("sent", 0),
+                "pending_ids": counts.get("pending", 0), "blocked_ids": counts.get("blocked", 0),
+                "visuals": visuals}
+
     def recent(self, scope: str) -> set[str]:
         db = self._connection()
         return {row[0] for row in db.execute('''
